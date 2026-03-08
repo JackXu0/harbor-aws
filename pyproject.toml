@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harbor-aws"
+version = "0.1.0"
+description = "AWS ECS/Fargate execution backend for Harbor benchmarks"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.35.0",
+    "harbor>=0.1.43",
+    "tenacity>=8.0.0",
+]
+
+[project.optional-dependencies]
+cdk = [
+    "aws-cdk-lib>=2.150.0",
+    "constructs>=10.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.12",
+    "pytest-cov>=5.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13",
+    "moto[ecs,ecr,s3,codebuild,iam,ec2]>=5.0",
+]
+
+[project.scripts]
+harbor-aws = "harbor_aws.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harbor_aws"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "N", "UP", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
