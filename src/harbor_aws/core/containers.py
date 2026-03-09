@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
 from harbor_aws.core.config import AWSConfig, map_to_fargate_resources
 
@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential_jitter(initial=2, max=15, jitter=3),
     reraise=True,
 )
 async def register_task_definition(
@@ -24,7 +24,6 @@ async def register_task_definition(
     environment_name: str,
     cpus: int,
     memory_mb: int,
-    storage_gb: int = 21,
     env_vars: dict[str, str] | None = None,
 ) -> str:
     """Register an ECS task definition for Fargate.
@@ -35,7 +34,9 @@ async def register_task_definition(
 
     container_env = [{"name": k, "value": v} for k, v in (env_vars or {}).items()]
 
-    family = f"harbor-aws-{environment_name}"[:255]
+    import re
+
+    family = re.sub(r"[^a-zA-Z0-9-]", "-", f"harbor-aws-{environment_name}")[:255]
 
     task_def = {
         "family": family,
@@ -68,10 +69,6 @@ async def register_task_definition(
         ],
     }
 
-    # Fargate ephemeral storage (min 21 GB, max 200 GB)
-    if storage_gb > 21:
-        task_def["ephemeralStorage"] = {"sizeInGiB": min(storage_gb, 200)}
-
     response = await asyncio.to_thread(
         ecs_client.register_task_definition,  # type: ignore[union-attr]
         **task_def,
@@ -83,8 +80,8 @@ async def register_task_definition(
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(initial=1, max=10, jitter=2),
     reraise=True,
 )
 async def run_task(
@@ -190,8 +187,8 @@ async def wait_for_task_running(
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential_jitter(initial=1, max=30, jitter=5),
     reraise=True,
 )
 async def stop_task(

@@ -3,3 +3,4 @@ __pycache__/
 cdk.out/
 .env
 *.egg-info/
+jobs/

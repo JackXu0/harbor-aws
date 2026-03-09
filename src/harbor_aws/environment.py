@@ -10,18 +10,15 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from harbor_aws.core import containers, exec, files, images
-from harbor_aws.core.clients import AWSClients, ECSClientManager
-from harbor_aws.core.config import AWSConfig
-from harbor_aws.core.stack import load_config_from_stack
+from harbor_aws.core import containers, exec
+from harbor_aws.core.config import AWSConfig, create_ecs_client, load_config_from_stack
 
 
 class AWSEnvironment(BaseEnvironment):
     """AWS ECS/Fargate implementation for Harbor sandboxes.
 
     Runs each sandbox as a Fargate task with ECS Exec for command execution.
-    Images are built via CodeBuild and stored in ECR. File transfer uses
-    base64-over-exec.
+    Uses prebuilt Docker images. File transfer uses base64-over-exec.
 
     Configuration can be provided either:
     1. Directly via kwargs (subnets, security_groups, etc.)
@@ -29,8 +26,7 @@ class AWSEnvironment(BaseEnvironment):
 
     Usage with Harbor CLI:
         harbor trials start -p ./task \\
-            --environment-import-path harbor_aws.environment:AWSEnvironment \\
-            --ek stack_name=harbor-aws
+            --environment-import-path harbor_aws.environment:AWSEnvironment
     """
 
     def __init__(
@@ -43,19 +39,13 @@ class AWSEnvironment(BaseEnvironment):
         # AWS-specific kwargs (passed via --environment-kwarg)
         region: str = "us-east-1",
         profile_name: str | None = None,
-        stack_name: str | None = None,
+        stack_name: str = "harbor-aws",
         cluster_name: str = "harbor-aws",
         subnets: str | list[str] | None = None,
         security_groups: str | list[str] | None = None,
         assign_public_ip: bool = True,
         task_execution_role_arn: str = "",
         task_role_arn: str = "",
-        ecr_repository_uri: str = "",
-        codebuild_project_name: str = "harbor-aws-builder",
-        s3_bucket: str = "",
-        s3_prefix: str = "harbor-aws/",
-        build_timeout_minutes: int = 30,
-        auto_provision: bool = True,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -84,19 +74,12 @@ class AWSEnvironment(BaseEnvironment):
             assign_public_ip=assign_public_ip,
             task_execution_role_arn=task_execution_role_arn,
             task_role_arn=task_role_arn,
-            ecr_repository_uri=ecr_repository_uri,
-            codebuild_project_name=codebuild_project_name,
-            s3_bucket=s3_bucket,
-            s3_prefix=s3_prefix,
-            build_timeout_minutes=build_timeout_minutes,
-            auto_provision=auto_provision if isinstance(auto_provision, bool) else auto_provision != "false",
         )
 
-        self._client_manager: ECSClientManager | None = None
-        self._clients: AWSClients | None = None
+        self._ecs_client: object | None = None
         self._task_arn: str | None = None
         self._task_definition_arn: str | None = None
-        self._config_loaded = bool(not stack_name and subnet_list)
+        self._config_loaded = bool(subnet_list)
 
     @staticmethod
     def type() -> EnvironmentType:
@@ -117,9 +100,7 @@ class AWSEnvironment(BaseEnvironment):
         return True
 
     def _validate_definition(self) -> None:
-        dockerfile = self.environment_dir / "Dockerfile"
-        if not dockerfile.exists():
-            raise FileNotFoundError(f"{dockerfile} not found. AWSEnvironment requires a Dockerfile.")
+        pass  # prebuilt images only, no Dockerfile needed
 
     async def _ensure_config(self) -> None:
         """Load config from CloudFormation stack if stack_name was provided."""
@@ -132,19 +113,16 @@ class AWSEnvironment(BaseEnvironment):
                 stack_name=self._aws_config.stack_name,
                 region=self._aws_config.region,
                 profile_name=self._aws_config.profile_name,
-                auto_provision=self._aws_config.auto_provision,
             )
         else:
             self._aws_config.validate()
 
         self._config_loaded = True
 
-    async def _ensure_clients(self) -> None:
-        """Initialize client manager and get clients."""
-        if self._client_manager is None:
-            self._client_manager = await ECSClientManager.get_instance()
-        if self._clients is None:
-            self._clients = await self._client_manager.get_clients(self._aws_config)
+    def _ensure_clients(self) -> None:
+        """Initialize boto3 clients."""
+        if self._ecs_client is None:
+            self._ecs_client = create_ecs_client(self._aws_config)
 
     async def start(self, force_build: bool) -> None:
         """Start an ECS Fargate task."""
@@ -152,54 +130,30 @@ class AWSEnvironment(BaseEnvironment):
         await exec.check_session_manager_plugin()
 
         await self._ensure_config()
-        await self._ensure_clients()
-        assert self._clients is not None
+        self._ensure_clients()
 
-        image_name = self.environment_name
-        image_tag = "latest"
-        ecr_repo_name = self._aws_config.ecr_repository_uri.rsplit("/", 1)[-1]
-
-        # Build image if needed
-        if force_build:
-            await images.build_and_push_image(
-                self._clients.codebuild,
-                self._clients.s3,
-                self._aws_config,
-                self.environment_dir,
-                image_name,
-                image_tag,
+        # Use prebuilt image from benchmark config
+        image_uri = self.task_env_config.docker_image
+        if not image_uri:
+            raise RuntimeError(
+                "No docker_image specified in benchmark config. "
+                "harbor-aws only supports prebuilt images."
             )
-        else:
-            if not await images.image_exists(self._clients.ecr, ecr_repo_name, f"{image_name}-{image_tag}"):
-                self.logger.debug("Image not found in ECR, building...")
-                await images.build_and_push_image(
-                    self._clients.codebuild,
-                    self._clients.s3,
-                    self._aws_config,
-                    self.environment_dir,
-                    image_name,
-                    image_tag,
-                )
-            else:
-                self.logger.debug("Using existing image from ECR")
-
-        image_uri = images.get_image_uri(self._aws_config, image_name, image_tag)
+        self.logger.debug("Using image: %s", image_uri)
 
         # Register task definition
-        storage_gb = max(21, self.task_env_config.storage_mb // 1024 + 1)
         self._task_definition_arn = await containers.register_task_definition(
-            self._clients.ecs,
+            self._ecs_client,
             self._aws_config,
             image_uri,
             self.environment_name,
             cpus=self.task_env_config.cpus,
             memory_mb=self.task_env_config.memory_mb,
-            storage_gb=storage_gb,
         )
 
         # Run task
         self._task_arn = await containers.run_task(
-            self._clients.ecs,
+            self._ecs_client,
             self._aws_config,
             self._task_definition_arn,
             self.session_id,
@@ -207,7 +161,7 @@ class AWSEnvironment(BaseEnvironment):
 
         # Wait for task and ECS Exec agent to be ready
         await containers.wait_for_task_running(
-            self._clients.ecs,
+            self._ecs_client,
             self._aws_config,
             self._task_arn,
         )
@@ -220,15 +174,15 @@ class AWSEnvironment(BaseEnvironment):
     async def stop(self, delete: bool) -> None:
         """Stop the Fargate task."""
         try:
-            if self._task_arn and self._clients:
+            if self._task_arn and self._ecs_client:
                 await containers.stop_task(
-                    self._clients.ecs,
+                    self._ecs_client,
                     self._aws_config,
                     self._task_arn,
                 )
-            if delete and self._task_definition_arn and self._clients:
+            if delete and self._task_definition_arn and self._ecs_client:
                 await containers.deregister_task_definition(
-                    self._clients.ecs,
+                    self._ecs_client,
                     self._task_definition_arn,
                 )
         except Exception as e:
@@ -236,15 +190,7 @@ class AWSEnvironment(BaseEnvironment):
         finally:
             self._task_arn = None
             self._task_definition_arn = None
-
-            if self._client_manager:
-                try:
-                    await self._client_manager.release_clients()
-                except Exception as e:
-                    self.logger.error("Error releasing AWS clients: %s", e)
-                finally:
-                    self._client_manager = None
-                    self._clients = None
+            self._ecs_client = None
 
     async def exec(
         self,
@@ -274,19 +220,19 @@ class AWSEnvironment(BaseEnvironment):
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         """Upload a file to the container."""
-        await files.upload_file(self._exec_fn, Path(source_path), target_path)
+        await exec.upload_file(self._exec_fn, Path(source_path), target_path)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         """Upload a directory to the container."""
-        await files.upload_dir(self._exec_fn, Path(source_dir), target_dir)
+        await exec.upload_dir(self._exec_fn, Path(source_dir), target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         """Download a file from the container."""
-        await files.download_file(self._exec_fn, source_path, Path(target_path))
+        await exec.download_file(self._exec_fn, source_path, Path(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         """Download a directory from the container."""
-        await files.download_dir(self._exec_fn, source_dir, Path(target_dir))
+        await exec.download_dir(self._exec_fn, source_dir, Path(target_dir))
 
     async def _exec_fn(
         self,

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "AWS ECS/Fargate execution backend for Harbor benchmarks"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.35.0",
     "harbor>=0.1.43",

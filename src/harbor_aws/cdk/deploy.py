@@ -58,39 +58,65 @@ async def deploy(
         # Check current state
         status = _get_stack_status(cfn, stack_prefix)
 
-        if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"):
-            logger.info("Stack '%s' already deployed (%s). Nothing to do.", stack_prefix, status)
-            return _get_outputs(cfn, stack_prefix)
-
         if status is not None and status.endswith("_IN_PROGRESS"):
             logger.info("Stack '%s' has operation in progress (%s). Waiting...", stack_prefix, status)
             _wait_for_completion(cfn, stack_prefix)
             return _get_outputs(cfn, stack_prefix)
 
-        if status is not None:
-            raise RuntimeError(
-                f"Stack '{stack_prefix}' is in state '{status}'. "
-                "Delete it first: aws cloudformation delete-stack --stack-name " + stack_prefix
+        if status is None:
+            # Create new stack
+            logger.info("Creating stack '%s' in %s...", stack_prefix, region)
+            cfn.create_stack(
+                StackName=stack_prefix,
+                TemplateBody=template_body,
+                Capabilities=["CAPABILITY_NAMED_IAM"],
+                Tags=[{"Key": "managed-by", "Value": "harbor-aws"}],
+                OnFailure="DELETE",
             )
+            logger.info("Waiting for stack creation (this takes ~3-5 minutes)...")
+            _wait_for_completion(cfn, stack_prefix)
+            logger.info("Stack '%s' is ready.", stack_prefix)
+            return _get_outputs(cfn, stack_prefix)
 
-        # Create new stack
-        logger.info("Creating stack '%s' in %s...", stack_prefix, region)
-        cfn.create_stack(
-            StackName=stack_prefix,
-            TemplateBody=template_body,
-            Capabilities=["CAPABILITY_NAMED_IAM"],
-            Tags=[
-                {"Key": "managed-by", "Value": "harbor-aws"},
-            ],
-            OnFailure="DELETE",
-        )
-
-        logger.info("Waiting for stack creation (this takes ~3-5 minutes)...")
-        _wait_for_completion(cfn, stack_prefix)
-        logger.info("Stack '%s' is ready.", stack_prefix)
+        # Stack exists — update it
+        logger.info("Updating stack '%s'...", stack_prefix)
+        try:
+            _update_stack_with_retry(cfn, stack_prefix, template_body)
+            logger.info("Waiting for stack update...")
+            _wait_for_completion(cfn, stack_prefix)
+            logger.info("Stack '%s' updated.", stack_prefix)
+        except Exception as e:
+            if "No updates are to be performed" in str(e):
+                logger.info("Stack '%s' is already up to date.", stack_prefix)
+            else:
+                raise
         return _get_outputs(cfn, stack_prefix)
 
     return await asyncio.to_thread(_deploy)
+
+
+def _update_stack_with_retry(cfn: object, stack_name: str, template_body: str, max_retries: int = 5) -> None:
+    """Update stack with retry on throttling."""
+    import time
+    import random
+
+    for attempt in range(max_retries):
+        try:
+            cfn.update_stack(  # type: ignore[union-attr]
+                StackName=stack_name,
+                TemplateBody=template_body,
+                Capabilities=["CAPABILITY_NAMED_IAM"],
+                Tags=[{"Key": "managed-by", "Value": "harbor-aws"}],
+            )
+            return
+        except Exception as e:
+            if "Throttling" in str(e) or "Rate exceeded" in str(e):
+                wait = min(2 ** attempt + random.uniform(0, 2), 30)
+                logger.info("  CloudFormation throttled, retrying in %.0fs...", wait)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"CloudFormation update throttled after {max_retries} retries")
 
 
 def _get_stack_status(cfn: object, stack_name: str) -> str | None:

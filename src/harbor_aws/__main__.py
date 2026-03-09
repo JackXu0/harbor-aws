@@ -3,7 +3,8 @@
 Commands:
     deploy   - Create harbor-aws infrastructure in your AWS account
     status   - Check if infrastructure is deployed
-    destroy  - Tear down infrastructure
+    stop     - Stop all running tasks (keeps infrastructure)
+    destroy  - Tear down everything
 """
 
 from __future__ import annotations
@@ -35,8 +36,14 @@ def main() -> None:
     status_p.add_argument("--region", default="us-east-1")
     status_p.add_argument("--profile", default=None)
 
+    # stop
+    stop_p = sub.add_parser("stop", help="stop all running tasks (keeps infrastructure)")
+    stop_p.add_argument("--stack-name", default="harbor-aws")
+    stop_p.add_argument("--region", default="us-east-1")
+    stop_p.add_argument("--profile", default=None)
+
     # destroy
-    destroy_p = sub.add_parser("destroy", help="tear down infrastructure")
+    destroy_p = sub.add_parser("destroy", help="tear down everything")
     destroy_p.add_argument("--stack-name", default="harbor-aws")
     destroy_p.add_argument("--region", default="us-east-1")
     destroy_p.add_argument("--profile", default=None)
@@ -48,11 +55,14 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
     )
+    logging.getLogger("botocore").setLevel(logging.WARNING)
 
     if args.command == "deploy":
         asyncio.run(_deploy(args))
     elif args.command == "status":
         asyncio.run(_status(args))
+    elif args.command == "stop":
+        asyncio.run(_stop(args))
     elif args.command == "destroy":
         asyncio.run(_destroy(args))
     else:
@@ -98,6 +108,15 @@ async def _status(args: argparse.Namespace) -> None:
             raise
 
 
+async def _stop(args: argparse.Namespace) -> None:
+    import boto3
+
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    await _cleanup_ecs(session, args.stack_name)
+    await _cleanup_task_definitions(session, args.stack_name)
+    print("Cleaned up running tasks. Infrastructure ready for next run.")
+
+
 async def _destroy(args: argparse.Namespace) -> None:
     import boto3
 
@@ -120,12 +139,7 @@ async def _destroy(args: argparse.Namespace) -> None:
     print(f"  Stack:      {args.stack_name}")
     if outputs.get("ClusterName"):
         print(f"  ECS:        cluster '{outputs['ClusterName']}' (+ stop running tasks)")
-    if outputs.get("ECRRepositoryUri"):
-        ecr_name = outputs["ECRRepositoryUri"].rsplit("/", 1)[-1]
-        print(f"  ECR:        repository '{ecr_name}' (all images deleted)")
-    if outputs.get("S3BucketName"):
-        print(f"  S3:         bucket '{outputs['S3BucketName']}' (all objects deleted)")
-    print(f"  + VPC, IAM roles, CodeBuild project, log groups")
+    print(f"  + VPC, IAM roles, log groups, dashboard")
 
     if not args.yes:
         confirm = input("\nProceed? [y/N] ")
@@ -137,27 +151,13 @@ async def _destroy(args: argparse.Namespace) -> None:
     if outputs.get("ClusterName"):
         await _cleanup_ecs(session, outputs["ClusterName"])
 
-    # 2. Empty the S3 bucket (CloudFormation can't delete non-empty buckets)
-    if outputs.get("S3BucketName"):
-        await _empty_s3_bucket(session, outputs["S3BucketName"])
-
-    # 3. Delete all images in ECR (repo has RETAIN policy, must clean manually)
-    ecr_repo_name = None
-    if outputs.get("ECRRepositoryUri"):
-        ecr_repo_name = outputs["ECRRepositoryUri"].rsplit("/", 1)[-1]
-        await _empty_ecr_repo(session, ecr_repo_name)
-
-    # 4. Delete the CloudFormation stack
+    # 2. Delete the CloudFormation stack
     print("Deleting CloudFormation stack...")
     cfn.delete_stack(StackName=args.stack_name)
     waiter = cfn.get_waiter("stack_delete_complete")
     waiter.wait(StackName=args.stack_name, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
 
-    # 5. Delete the retained ECR repo (not deleted by CloudFormation due to RETAIN policy)
-    if ecr_repo_name:
-        await _delete_ecr_repo(session, ecr_repo_name)
-
-    # 6. Deregister orphaned task definitions
+    # 3. Deregister orphaned task definitions
     await _cleanup_task_definitions(session, args.stack_name)
 
     print("All resources cleaned up.")
@@ -184,70 +184,6 @@ async def _cleanup_ecs(session: object, cluster_name: str) -> None:
         print(f"  Stopped {count} running task(s).")
 
 
-async def _empty_s3_bucket(session: object, bucket_name: str) -> None:
-    """Delete all objects and versions from an S3 bucket."""
-    import asyncio as aio
-
-    s3 = session.resource("s3")  # type: ignore[union-attr]
-
-    def _empty() -> int:
-        bucket = s3.Bucket(bucket_name)
-        # Delete all object versions (handles versioned buckets too)
-        count = 0
-        for batch in _batched(bucket.object_versions.all(), 1000):
-            bucket.delete_objects(Delete={"Objects": [{"Key": v.key, "VersionId": v.id} for v in batch]})
-            count += len(batch)
-        if count == 0:
-            # Try non-versioned delete
-            for batch in _batched(bucket.objects.all(), 1000):
-                bucket.delete_objects(Delete={"Objects": [{"Key": o.key} for o in batch]})
-                count += len(batch)
-        return count
-
-    count = await aio.to_thread(_empty)
-    print(f"  S3: deleted {count} object(s) from '{bucket_name}'.")
-
-
-async def _empty_ecr_repo(session: object, repo_name: str) -> None:
-    """Delete all images from an ECR repository."""
-    import asyncio as aio
-
-    ecr = session.client("ecr")  # type: ignore[union-attr]
-
-    def _delete_images() -> int:
-        count = 0
-        try:
-            paginator = ecr.get_paginator("list_images")
-            for page in paginator.paginate(repositoryName=repo_name):
-                image_ids = page.get("imageIds", [])
-                if image_ids:
-                    ecr.batch_delete_image(repositoryName=repo_name, imageIds=image_ids)
-                    count += len(image_ids)
-        except ecr.exceptions.RepositoryNotFoundException:
-            pass
-        return count
-
-    count = await aio.to_thread(_delete_images)
-    if count:
-        print(f"  ECR: deleted {count} image(s) from '{repo_name}'.")
-
-
-async def _delete_ecr_repo(session: object, repo_name: str) -> None:
-    """Delete the ECR repository itself (retained by CloudFormation)."""
-    import asyncio as aio
-
-    ecr = session.client("ecr")  # type: ignore[union-attr]
-
-    def _delete() -> None:
-        try:
-            ecr.delete_repository(repositoryName=repo_name, force=True)
-        except ecr.exceptions.RepositoryNotFoundException:
-            pass
-
-    await aio.to_thread(_delete)
-    print(f"  ECR: deleted repository '{repo_name}'.")
-
-
 async def _cleanup_task_definitions(session: object, stack_prefix: str) -> None:
     """Deregister task definitions created by harbor-aws."""
     import asyncio as aio
@@ -269,18 +205,6 @@ async def _cleanup_task_definitions(session: object, stack_prefix: str) -> None:
     count = await aio.to_thread(_deregister)
     if count:
         print(f"  ECS: deregistered {count} task definition(s).")
-
-
-def _batched(iterable, n: int):  # type: ignore[no-untyped-def]
-    """Yield successive n-sized chunks from an iterable."""
-    batch = []
-    for item in iterable:
-        batch.append(item)
-        if len(batch) == n:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
 
 
 if __name__ == "__main__":

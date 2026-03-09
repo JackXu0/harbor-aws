@@ -9,69 +9,62 @@ Deploy once, run any Docker-based benchmark elastically on Fargate. Pay only for
 ### 1. Install
 
 ```bash
-git clone https://github.com/JackXu0/harbor-aws.git
-cd harbor-aws
-pip install -e ".[cdk]"
+uv sync --extra cdk
 ```
 
 ### 2. Deploy Infrastructure
 
 ```bash
-python -m harbor_aws deploy
+uv run python -m harbor_aws deploy
 ```
 
-That's it. Creates a shared VPC, ECS cluster, ECR repo, S3 bucket, and CodeBuild project in ~3-5 minutes. All resources are reused across benchmark environments.
-
-### 3. Run Benchmarks
+### 3. Run Terminal-Bench
 
 ```bash
-harbor trials start -p ./task \
-  --environment-import-path harbor_aws.environment:AWSEnvironment \
-  --ek stack_name=harbor-aws
-```
+uv run harbor run -d terminal-bench@2.0 -a swe-agent -m bedrock/zai.glm-4.7 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment```
 
-Infrastructure is also auto-provisioned on first run if you skip step 2.
+Other agent/model combinations:
+
+```bash
+# Sonnet 4 via Bedrock with swe-agent
+uv run harbor run -d terminal-bench@2.0 -a swe-agent -m bedrock/anthropic.claude-sonnet-4-20250514-v1:0 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment
+# Sonnet 4 via API key with aider
+export ANTHROPIC_API_KEY=sk-ant-...
+uv run harbor run -d terminal-bench@2.0 -a aider -m anthropic/claude-sonnet-4-20250514 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment```
 
 ### 4. Clean Up
 
 ```bash
-python -m harbor_aws destroy
+uv run python -m harbor_aws destroy
 ```
 
-This fully removes **everything** — stops running tasks, empties S3 and ECR, deletes the CloudFormation stack, and deregisters task definitions. Nothing is left behind.
-
-> **Note:** Do not use `aws cloudformation delete-stack` directly — it will fail on the non-empty S3 bucket and leave the ECR repository orphaned.
-
-### 5. Check Status
-
-```bash
-python -m harbor_aws status
-```
+Fully removes everything — running tasks, stack, task definitions. Nothing left behind.
 
 ## Prerequisites
 
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - AWS CLI configured with credentials
-- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (required for ECS Exec)
+- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 
 ## Cost
 
 | State | Cost |
 |---|---|
 | Idle (deployed, no tasks running) | ~$0/month |
-| Running benchmarks | Fargate on-demand pricing per task-second |
+| Running benchmarks | Fargate on-demand per task-second |
 
-All resources use pay-per-use pricing. No NAT gateways, no EC2 instances. S3 objects auto-expire after 7 days, logs after 7 days, ECR keeps last 50 images.
+No NAT gateways, no EC2 instances.
 
 ## CLI Reference
 
 ```
-python -m harbor_aws <command> [options]
+uv run python -m harbor_aws <command> [options]
 
 Commands:
-  deploy    Deploy infrastructure (idempotent, safe to re-run)
+  deploy    Deploy infrastructure (idempotent)
   status    Show stack status and outputs
-  destroy   Full cleanup of all resources
+  stop      Stop all running tasks (keeps infrastructure)
+  destroy   Full cleanup — tasks, stack, task definitions
 
 Options:
   --stack-name   Stack name (default: harbor-aws)
@@ -81,30 +74,6 @@ Options:
   -v, --verbose  Verbose output
 ```
 
-## Configuration
-
-Configuration is auto-loaded from CloudFormation stack outputs. Just pass the stack name:
-
-```bash
---ek stack_name=harbor-aws
-```
-
-For advanced use, you can pass individual parameters:
-
-```bash
-harbor trials start -p ./task \
-  --environment-import-path harbor_aws.environment:AWSEnvironment \
-  --ek region=us-east-1 \
-  --ek cluster_name=harbor-aws \
-  --ek subnets=subnet-abc,subnet-def \
-  --ek security_groups=sg-123 \
-  --ek task_execution_role_arn=arn:aws:iam::123:role/exec \
-  --ek task_role_arn=arn:aws:iam::123:role/task \
-  --ek ecr_repository_uri=123.dkr.ecr.us-east-1.amazonaws.com/harbor-aws \
-  --ek s3_bucket=harbor-aws-123-us-east-1 \
-  --ek codebuild_project_name=harbor-aws-builder
-```
-
 ## Architecture
 
 ```
@@ -112,25 +81,29 @@ harbor trials start -p ./task \
 │  Harbor CLI  │────▶│ AWSEnvironment │────▶│ ECS Fargate  │
 │             │     │   (adapter)    │     │ (on-demand)  │
 └─────────────┘     └────────────────┘     └──────────────┘
-                           │                      │
-                    ┌──────┴──────┐         ┌─────┴─────┐
-                    │  CodeBuild   │         │ ECS Exec  │
-                    │  (LARGE)     │         │  (SSM)    │
-                    └──────┬──────┘         └───────────┘
-                           │
-                    ┌──────┴──────┐
-                    │    ECR      │
-                    │ (registry)  │
-                    └─────────────┘
+                                                  │
+                                            ┌─────┴─────┐
+                                            │ ECS Exec  │
+                                            │  (SSM)    │
+                                            └───────────┘
 ```
 
-Infrastructure is defined as a CDK stack in `src/harbor_aws/cdk/stack.py`. Deployment synthesizes the CDK in-memory and deploys via CloudFormation — no CDK CLI needed.
+Infrastructure defined as CDK in `src/harbor_aws/cdk/stack.py`. Deployment synthesizes in-memory and deploys via CloudFormation — no CDK CLI needed.
+
+## Monitoring
+
+A CloudWatch dashboard (`harbor-aws-monitor`) is created with the stack:
+
+- **ECS Fargate** — running/pending task counts
+- **Bedrock** — tokens, invocations, errors, throttles, latency (per model)
+
+View at: `https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=harbor-aws-monitor`
 
 ## Development
 
 ```bash
-pip install -e ".[dev,cdk]"
-pytest
-ruff check src/
-mypy src/
+uv sync --extra dev --extra cdk
+uv run pytest
+uv run ruff check src/
+uv run mypy src/
 ```

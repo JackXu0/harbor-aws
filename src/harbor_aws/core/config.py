@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass, field
+
+import boto3
+
+logger = logging.getLogger(__name__)
 
 # Valid Fargate CPU/memory combinations
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
@@ -33,22 +39,8 @@ class AWSConfig:
     task_execution_role_arn: str = ""
     task_role_arn: str = ""
 
-    # ECR
-    ecr_repository_uri: str = ""
-
-    # CodeBuild
-    codebuild_project_name: str = "harbor-aws-builder"
-    build_timeout_minutes: int = 30
-
-    # S3 (for build context and file transfer)
-    s3_bucket: str = ""
-    s3_prefix: str = "harbor-aws/"
-
     # Stack-based configuration (alternative to individual fields)
     stack_name: str | None = None
-
-    # Auto-provision: deploy infrastructure if stack doesn't exist
-    auto_provision: bool = True
 
     def validate(self) -> None:
         """Validate that required fields are set."""
@@ -57,8 +49,6 @@ class AWSConfig:
             "security_groups": self.security_groups,
             "task_execution_role_arn": self.task_execution_role_arn,
             "task_role_arn": self.task_role_arn,
-            "ecr_repository_uri": self.ecr_repository_uri,
-            "s3_bucket": self.s3_bucket,
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
@@ -100,3 +90,55 @@ def map_to_fargate_resources(cpus: int, memory_mb: int) -> tuple[str, str]:
             break
 
     return str(fargate_cpu), str(fargate_memory)
+
+
+def create_ecs_client(config: AWSConfig) -> object:
+    """Create a boto3 ECS client."""
+    session = boto3.Session(
+        region_name=config.region,
+        profile_name=config.profile_name or None,
+    )
+    return session.client("ecs")
+
+
+async def load_config_from_stack(
+    stack_name: str,
+    region: str = "us-east-1",
+    profile_name: str | None = None,
+) -> AWSConfig:
+    """Load AWSConfig from CloudFormation stack outputs."""
+
+    def _read_outputs() -> dict[str, str]:
+        session = boto3.Session(profile_name=profile_name, region_name=region)
+        cfn = session.client("cloudformation")
+        response = cfn.describe_stacks(StackName=stack_name)
+
+        stacks = response.get("Stacks", [])
+        if not stacks:
+            raise RuntimeError(
+                f"Stack '{stack_name}' not found. "
+                f"Deploy with: python -m harbor_aws deploy --stack-name {stack_name} --region {region}"
+            )
+
+        stack = stacks[0]
+        if stack["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"):
+            raise RuntimeError(f"Stack '{stack_name}' is in status {stack['StackStatus']}")
+
+        return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+    outputs = await asyncio.to_thread(_read_outputs)
+    logger.debug("Loaded %d outputs from stack '%s'", len(outputs), stack_name)
+
+    config = AWSConfig(
+        region=region,
+        profile_name=profile_name,
+        stack_name=stack_name,
+        cluster_name=outputs.get("ClusterName", "harbor-aws"),
+        subnets=outputs.get("SubnetIds", "").split(","),
+        security_groups=[outputs["SecurityGroupId"]] if "SecurityGroupId" in outputs else [],
+        task_execution_role_arn=outputs.get("TaskExecutionRoleArn", ""),
+        task_role_arn=outputs.get("TaskRoleArn", ""),
+    )
+
+    config.validate()
+    return config
