@@ -1,28 +1,31 @@
-"""Harbor BaseEnvironment adapter for AWS ECS/Fargate."""
+"""Harbor BaseEnvironment adapter for AWS EKS/Fargate."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import subprocess
 from pathlib import Path
+
+from kubernetes import client
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from harbor_aws.core import containers, exec
-from harbor_aws.core.config import AWSConfig, create_ecs_client, create_s3_client, load_config_from_stack
+from harbor_aws.core import exec, pods
+from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
 
 
 class AWSEnvironment(BaseEnvironment):
-    """AWS ECS/Fargate implementation for Harbor sandboxes.
+    """AWS EKS/Fargate implementation for Harbor sandboxes.
 
-    Runs each sandbox as a Fargate task. Commands are executed via an S3
-    command channel — no SSM/ECS Exec needed. File transfer also goes
-    through S3.
+    Runs each sandbox as a Kubernetes pod on EKS Fargate. Commands are executed
+    via `kubectl exec` (WebSocket). File transfer uses `kubectl cp`.
 
     Configuration can be provided either:
-    1. Directly via kwargs (subnets, security_groups, etc.)
+    1. Directly via kwargs (eks_cluster_name, namespace, etc.)
     2. Via stack_name to auto-read from CloudFormation stack outputs
     """
 
@@ -37,17 +40,11 @@ class AWSEnvironment(BaseEnvironment):
         region: str = "us-east-1",
         profile_name: str | None = None,
         stack_name: str = "harbor-aws",
-        cluster_name: str = "harbor-aws",
-        subnets: str | list[str] | None = None,
-        security_groups: str | list[str] | None = None,
-        assign_public_ip: bool = True,
-        task_execution_role_arn: str = "",
-        task_role_arn: str = "",
-        s3_bucket: str = "",
+        eks_cluster_name: str = "harbor-aws",
+        namespace: str = "harbor",
         logger: logging.Logger | None = None,
         **kwargs,
     ):
-        """Initialize an AWSEnvironment instance."""
         super().__init__(
             environment_dir=environment_dir,
             environment_name=environment_name,
@@ -58,33 +55,21 @@ class AWSEnvironment(BaseEnvironment):
             **kwargs,
         )
 
-        # Parse comma-separated strings from CLI kwargs
-        subnet_list = _parse_list(subnets) if subnets else []
-        sg_list = _parse_list(security_groups) if security_groups else []
-
         self._aws_config = AWSConfig(
             region=region,
             profile_name=profile_name,
             stack_name=stack_name,
-            cluster_name=cluster_name,
-            subnets=subnet_list,
-            security_groups=sg_list,
-            assign_public_ip=assign_public_ip,
-            task_execution_role_arn=task_execution_role_arn,
-            task_role_arn=task_role_arn,
-            s3_bucket=s3_bucket,
+            eks_cluster_name=eks_cluster_name,
+            namespace=namespace,
         )
 
-        self._ecs_client: object | None = None
-        self._s3_client: object | None = None
-        self._task_arn: str | None = None
-        self._task_definition_arn: str | None = None
-        self._s3_prefix: str = ""
-        self._config_loaded = bool(subnet_list)
+        self._k8s_api: client.CoreV1Api | None = None
+        self._pod_name: str | None = None
+        self._config_loaded = bool(eks_cluster_name and eks_cluster_name != "harbor-aws" and not stack_name)
 
     @staticmethod
     def type() -> EnvironmentType:
-        return EnvironmentType("ecs")
+        return EnvironmentType("eks")
 
     @property
     def is_mounted(self) -> bool:
@@ -99,7 +84,7 @@ class AWSEnvironment(BaseEnvironment):
         return True
 
     def _validate_definition(self) -> None:
-        pass  # prebuilt images only, no Dockerfile needed
+        pass  # prebuilt images only
 
     async def _ensure_config(self) -> None:
         """Load config from CloudFormation stack if stack_name was provided."""
@@ -118,21 +103,16 @@ class AWSEnvironment(BaseEnvironment):
 
         self._config_loaded = True
 
-    def _ensure_clients(self) -> None:
-        """Initialize boto3 clients."""
-        if self._ecs_client is None:
-            self._ecs_client = create_ecs_client(self._aws_config)
-        if self._s3_client is None:
-            self._s3_client = create_s3_client(self._aws_config)
+    def _ensure_k8s_client(self) -> None:
+        """Initialize Kubernetes API client."""
+        if self._k8s_api is None:
+            self._k8s_api = create_k8s_client(self._aws_config)
 
     async def start(self, force_build: bool) -> None:
-        """Start an ECS Fargate task with the S3 command daemon."""
+        """Start a Kubernetes pod for the benchmark task."""
         await self._ensure_config()
-        self._ensure_clients()
+        self._ensure_k8s_client()
 
-        self._s3_prefix = f"{self._aws_config.s3_prefix}{self.session_id}/"
-
-        # Use prebuilt image from benchmark config
         image_uri = self.task_env_config.docker_image
         if not image_uri:
             raise RuntimeError(
@@ -141,9 +121,8 @@ class AWSEnvironment(BaseEnvironment):
             )
         self.logger.debug("Using image: %s", image_uri)
 
-        # Register task definition (injects daemon into entrypoint)
-        self._task_definition_arn = await containers.register_task_definition(
-            self._ecs_client,
+        self._pod_name = await pods.create_pod(
+            self._k8s_api,
             self._aws_config,
             image_uri,
             self.environment_name,
@@ -152,24 +131,11 @@ class AWSEnvironment(BaseEnvironment):
             memory_mb=self.task_env_config.memory_mb,
         )
 
-        # Run task
-        self._task_arn = await containers.run_task(
-            self._ecs_client,
+        await pods.wait_for_pod_running(
+            self._k8s_api,
             self._aws_config,
-            self._task_definition_arn,
-            self.session_id,
+            self._pod_name,
         )
-
-        # Wait for task to be running
-        await containers.wait_for_task_running(
-            self._ecs_client,
-            self._aws_config,
-            self._task_arn,
-        )
-
-        # Wait a few seconds for daemon to start and be ready to accept commands
-        import asyncio
-        await asyncio.sleep(5)
 
         # Create required log directories
         mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
@@ -177,26 +143,19 @@ class AWSEnvironment(BaseEnvironment):
             raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
 
     async def stop(self, delete: bool) -> None:
-        """Stop the Fargate task."""
+        """Delete the pod."""
         try:
-            if self._task_arn and self._ecs_client:
-                await containers.stop_task(
-                    self._ecs_client,
+            if self._pod_name and self._k8s_api:
+                await pods.delete_pod(
+                    self._k8s_api,
                     self._aws_config,
-                    self._task_arn,
-                )
-            if delete and self._task_definition_arn and self._ecs_client:
-                await containers.deregister_task_definition(
-                    self._ecs_client,
-                    self._task_definition_arn,
+                    self._pod_name,
                 )
         except Exception as e:
-            self.logger.warning("Error stopping task: %s", e)
+            self.logger.warning("Error deleting pod: %s", e)
         finally:
-            self._task_arn = None
-            self._task_definition_arn = None
-            self._ecs_client = None
-            self._s3_client = None
+            self._pod_name = None
+            self._k8s_api = None
 
     async def exec(
         self,
@@ -205,14 +164,14 @@ class AWSEnvironment(BaseEnvironment):
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
     ) -> ExecResult:
-        """Execute a command in the Fargate task via S3 command channel."""
-        if not self._task_arn:
-            raise RuntimeError("Task not running. Call start() first.")
+        """Execute a command in the pod via Kubernetes exec."""
+        if not self._pod_name:
+            raise RuntimeError("Pod not running. Call start() first.")
 
         stdout, stderr, return_code = await exec.exec_command(
-            s3_client=self._s3_client,
-            bucket=self._aws_config.s3_bucket,
-            s3_prefix=self._s3_prefix,
+            api=self._k8s_api,
+            pod_name=self._pod_name,
+            namespace=self._aws_config.namespace,
             command=command,
             cwd=cwd,
             env=env,
@@ -226,36 +185,28 @@ class AWSEnvironment(BaseEnvironment):
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        """Upload a file to the container via S3."""
-        await exec.upload_file(
-            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
-            Path(source_path), target_path,
-        )
+        await self._kubectl_cp(str(source_path), f"{self._pod_ref}:{target_path}")
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        """Upload a directory to the container via S3."""
-        await exec.upload_dir(
-            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
-            Path(source_dir), target_dir,
-        )
+        await self._kubectl_cp(str(source_dir), f"{self._pod_ref}:{target_dir}")
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        """Download a file from the container via S3."""
-        await exec.download_file(
-            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
-            source_path, Path(target_path),
-        )
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        await self._kubectl_cp(f"{self._pod_ref}:{source_path}", str(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        """Download a directory from the container via S3."""
-        await exec.download_dir(
-            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
-            source_dir, Path(target_dir),
+        Path(target_dir).mkdir(parents=True, exist_ok=True)
+        await self._kubectl_cp(f"{self._pod_ref}:{source_dir}", str(target_dir))
+
+    @property
+    def _pod_ref(self) -> str:
+        """Kubernetes pod reference for kubectl: namespace/pod-name."""
+        return f"{self._aws_config.namespace}/{self._pod_name}"
+
+    async def _kubectl_cp(self, src: str, dst: str) -> None:
+        cmd = ["kubectl", "cp", src, dst, "-c", "main"]
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=120,
         )
-
-
-def _parse_list(value: str | list[str]) -> list[str]:
-    """Parse a comma-separated string or list into a list of strings."""
-    if isinstance(value, list):
-        return value
-    return [v.strip() for v in value.split(",") if v.strip()]
+        if result.returncode != 0:
+            raise RuntimeError(f"kubectl cp failed: {result.stderr.strip()}")

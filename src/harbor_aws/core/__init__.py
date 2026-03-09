@@ -1,1 +1,1 @@
-"""Core AWS ECS/Fargate container management."""
+"""Core AWS EKS/Fargate container management."""

@@ -5,13 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "harbor-aws"
 version = "0.1.0"
-description = "AWS ECS/Fargate execution backend for Harbor benchmarks"
+description = "AWS EKS/Fargate execution backend for Harbor benchmarks"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.35.0",
     "harbor>=0.1.43",
+    "kubernetes>=31.0.0",
     "tenacity>=8.0.0",
 ]
 
@@ -27,7 +28,6 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.8.0",
     "mypy>=1.13",
-    "moto[ecs,ecr,s3,codebuild,iam,ec2]>=5.0",
 ]
 
 [project.scripts]

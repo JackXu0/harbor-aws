@@ -1,7 +1,7 @@
-"""Synth CDK stack and deploy via boto3 CloudFormation API.
+"""Deploy harbor-aws EKS infrastructure via CDK CLI.
 
-No CDK CLI needed — uses aws-cdk-lib to synthesize in-memory,
-then deploys the resulting CloudFormation template via boto3.
+EKS requires CDK bootstrap (for Lambda assets used by custom resources).
+This module uses `cdk deploy` which handles bootstrap assets automatically.
 """
 
 from __future__ import annotations
@@ -9,33 +9,35 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
+import tempfile
 
 logger = logging.getLogger(__name__)
 
 
-def synth_template(stack_prefix: str = "harbor-aws") -> dict:
-    """Synthesize the harbor-aws CDK stack into a CloudFormation template dict.
+def _write_cdk_app(stack_prefix: str, out_dir: str) -> str:
+    """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
+    app_code = f"""\
+import aws_cdk as cdk
+import sys
+sys.path.insert(0, "{os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))}")
+from harbor_aws.cdk.stack import HarborAWSStack
 
-    Requires: pip install harbor-aws[cdk]
-    """
-    try:
-        import aws_cdk as cdk
-    except ImportError:
-        raise ImportError(
-            "aws-cdk-lib is required. Install with: pip install harbor-aws[cdk]"
-        ) from None
+app = cdk.App()
+HarborAWSStack(app, "{stack_prefix}", stack_prefix="{stack_prefix}")
+app.synth()
+"""
+    app_path = os.path.join(out_dir, "app.py")
+    with open(app_path, "w") as f:
+        f.write(app_code)
 
-    from harbor_aws.cdk.stack import HarborAWSStack
+    cdk_json = {"app": f"python {app_path}"}
+    cdk_json_path = os.path.join(out_dir, "cdk.json")
+    with open(cdk_json_path, "w") as f:
+        json.dump(cdk_json, f)
 
-    app = cdk.App(context={"aws:cdk:disable-metadata": True})
-    HarborAWSStack(
-        app,
-        stack_prefix,
-        stack_prefix=stack_prefix,
-        synthesizer=cdk.DefaultStackSynthesizer(generate_bootstrap_version_rule=False),
-    )
-    assembly = app.synth()
-    return assembly.stacks[0].template
+    return out_dir
 
 
 async def deploy(
@@ -43,92 +45,97 @@ async def deploy(
     region: str = "us-east-1",
     profile_name: str | None = None,
 ) -> dict[str, str]:
-    """Deploy harbor-aws infrastructure. Returns stack outputs.
+    """Deploy harbor-aws EKS infrastructure. Returns stack outputs.
 
-    Idempotent: creates the stack if it doesn't exist, no-ops if it does.
+    Requires: npm install -g aws-cdk
     """
     import boto3
 
-    template_body = json.dumps(synth_template(stack_prefix))
-
     def _deploy() -> dict[str, str]:
         session = boto3.Session(profile_name=profile_name, region_name=region)
-        cfn = session.client("cloudformation")
 
-        # Check current state
-        status = _get_stack_status(cfn, stack_prefix)
+        # First, bootstrap CDK if needed
+        _ensure_cdk_bootstrap(region, profile_name)
 
-        if status is not None and status.endswith("_IN_PROGRESS"):
-            logger.info("Stack '%s' has operation in progress (%s). Waiting...", stack_prefix, status)
-            _wait_for_completion(cfn, stack_prefix)
-            return _get_outputs(cfn, stack_prefix)
+        # Deploy via CDK CLI
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            _write_cdk_app(stack_prefix, tmp_dir)
 
-        if status is None:
-            # Create new stack
-            logger.info("Creating stack '%s' in %s...", stack_prefix, region)
-            cfn.create_stack(
-                StackName=stack_prefix,
-                TemplateBody=template_body,
-                Capabilities=["CAPABILITY_NAMED_IAM"],
-                Tags=[{"Key": "managed-by", "Value": "harbor-aws"}],
-                OnFailure="DELETE",
+            env = os.environ.copy()
+            env["AWS_DEFAULT_REGION"] = region
+            if profile_name:
+                env["AWS_PROFILE"] = profile_name
+
+            logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
+
+            result = subprocess.run(
+                [
+                    "cdk", "deploy",
+                    "--app", f"python {os.path.join(tmp_dir, 'app.py')}",
+                    "--require-approval", "never",
+                    "--outputs-file", os.path.join(tmp_dir, "outputs.json"),
+                ],
+                cwd=tmp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=1800,
             )
-            logger.info("Waiting for stack creation (this takes ~3-5 minutes)...")
-            _wait_for_completion(cfn, stack_prefix)
-            logger.info("Stack '%s' is ready.", stack_prefix)
-            return _get_outputs(cfn, stack_prefix)
 
-        # Stack exists — update it
-        logger.info("Updating stack '%s'...", stack_prefix)
-        try:
-            _update_stack_with_retry(cfn, stack_prefix, template_body)
-            logger.info("Waiting for stack update...")
-            _wait_for_completion(cfn, stack_prefix)
-            logger.info("Stack '%s' updated.", stack_prefix)
-        except Exception as e:
-            if "No updates are to be performed" in str(e):
-                logger.info("Stack '%s' is already up to date.", stack_prefix)
-            else:
-                raise
+            if result.returncode != 0:
+                logger.error("CDK deploy stderr:\n%s", result.stderr[-2000:] if result.stderr else "")
+                raise RuntimeError(f"CDK deploy failed (exit code {result.returncode})")
+
+            # Read outputs from CDK output file
+            outputs_file = os.path.join(tmp_dir, "outputs.json")
+            if os.path.exists(outputs_file):
+                with open(outputs_file) as f:
+                    all_outputs = json.load(f)
+                # CDK outputs are nested under the stack name
+                return all_outputs.get(stack_prefix, {})
+
+        # Fallback: read from CloudFormation
+        cfn = session.client("cloudformation")
         return _get_outputs(cfn, stack_prefix)
 
     return await asyncio.to_thread(_deploy)
 
 
-def _update_stack_with_retry(cfn: object, stack_name: str, template_body: str, max_retries: int = 5) -> None:
-    """Update stack with retry on throttling."""
-    import time
-    import random
+def _ensure_cdk_bootstrap(region: str, profile_name: str | None) -> None:
+    """Ensure CDK bootstrap stack exists."""
+    import boto3
 
-    for attempt in range(max_retries):
-        try:
-            cfn.update_stack(  # type: ignore[union-attr]
-                StackName=stack_name,
-                TemplateBody=template_body,
-                Capabilities=["CAPABILITY_NAMED_IAM"],
-                Tags=[{"Key": "managed-by", "Value": "harbor-aws"}],
-            )
-            return
-        except Exception as e:
-            if "Throttling" in str(e) or "Rate exceeded" in str(e):
-                wait = min(2 ** attempt + random.uniform(0, 2), 30)
-                logger.info("  CloudFormation throttled, retrying in %.0fs...", wait)
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(f"CloudFormation update throttled after {max_retries} retries")
+    session = boto3.Session(profile_name=profile_name, region_name=region)
+    cfn = session.client("cloudformation")
 
-
-def _get_stack_status(cfn: object, stack_name: str) -> str | None:
-    """Get CloudFormation stack status, or None if it doesn't exist."""
     try:
-        response = cfn.describe_stacks(StackName=stack_name)  # type: ignore[union-attr]
-        stacks = response.get("Stacks", [])
-        return stacks[0]["StackStatus"] if stacks else None
+        response = cfn.describe_stacks(StackName="CDKToolkit")
+        status = response["Stacks"][0]["StackStatus"]
+        if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+            return  # Already bootstrapped
     except Exception as e:
-        if "does not exist" in str(e):
-            return None
-        raise
+        if "does not exist" not in str(e):
+            raise
+
+    logger.info("CDK bootstrap not found. Running 'cdk bootstrap'...")
+    env = os.environ.copy()
+    env["AWS_DEFAULT_REGION"] = region
+    if profile_name:
+        env["AWS_PROFILE"] = profile_name
+
+    result = subprocess.run(
+        ["cdk", "bootstrap", f"aws://unknown-account/{region}"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"CDK bootstrap failed. Install CDK CLI: npm install -g aws-cdk\n"
+            f"stderr: {result.stderr[-1000:] if result.stderr else ''}"
+        )
+    logger.info("CDK bootstrap complete.")
 
 
 def _get_outputs(cfn: object, stack_name: str) -> dict[str, str]:
@@ -138,30 +145,3 @@ def _get_outputs(cfn: object, stack_name: str) -> dict[str, str]:
     if not stacks:
         raise RuntimeError(f"Stack '{stack_name}' not found")
     return {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
-
-
-def _wait_for_completion(cfn: object, stack_name: str, timeout_sec: int = 900) -> None:
-    """Wait for stack operation to complete."""
-    import time
-
-    for elapsed in range(0, timeout_sec, 10):
-        status = _get_stack_status(cfn, stack_name)
-
-        if status is None:
-            raise RuntimeError(
-                f"Stack '{stack_name}' was deleted (creation likely failed). "
-                "Check CloudFormation events in the AWS console."
-            )
-
-        if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
-            return
-
-        if status.endswith("_FAILED") or status in ("ROLLBACK_COMPLETE", "DELETE_COMPLETE"):
-            raise RuntimeError(f"Stack '{stack_name}' failed: {status}")
-
-        if elapsed % 30 == 0:
-            logger.info("  ...%s (%ds)", status, elapsed)
-
-        time.sleep(10)
-
-    raise RuntimeError(f"Stack '{stack_name}' did not complete within {timeout_sec}s")

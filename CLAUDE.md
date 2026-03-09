@@ -1,38 +1,36 @@
 # harbor-aws
 
-AWS ECS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Zero idle cost — pay only for Fargate runtime.
+AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Designed for maximum concurrency — run hundreds of benchmark tasks in parallel.
 
 ## Architecture
 
 - **CDK stack** (`src/harbor_aws/cdk/stack.py`) is the single source of truth for infrastructure
-- **S3 command channel**: commands are submitted as JSON to S3, a daemon in the container polls and executes them (no SSM/ECS Exec)
-- **boto3 client library** (`src/harbor_aws/core/`) wraps AWS APIs for running containers
-- **Shared resources**: one stack (VPC, ECS cluster, S3 bucket, IAM roles, CloudWatch) reused across all Docker environments
-- **On-demand Fargate** for max speed; prebuilt Docker images only
+- **Kubernetes exec**: commands run via WebSocket exec (same as `kubectl exec`) — no daemon, no polling
+- **Tar-over-exec** for file transfer (same mechanism as `kubectl cp`)
+- **Shared resources**: one stack (VPC, EKS cluster, IAM roles, CloudWatch) reused across all benchmark environments
+- **EKS Fargate** for serverless pods; prebuilt Docker images only
 
-### Cost When Idle: ~$0
+### Cost
 
-All resources are pay-per-use: VPC, ECS cluster, IAM roles, security groups = free. CloudWatch has negligible storage costs.
+- EKS control plane: ~$73/mo (fixed)
+- Fargate pods: pay-per-second only when running
+- VPC, IAM, CloudWatch: negligible
 
 ## Project Structure
 
 ```
 src/harbor_aws/
 ├── __init__.py              # Exports: AWSConfig, AWSEnvironment
-├── __main__.py              # CLI: python -m harbor_aws deploy|status|destroy
+├── __main__.py              # CLI: python -m harbor_aws deploy|status|stop|destroy
 ├── environment.py           # Harbor BaseEnvironment adapter
-├── daemon.py               # Container-side daemon (polls S3 for commands)
 ├── cdk/
 │   ├── stack.py             # CDK stack (single source of truth for infra)
 │   └── deploy.py            # CDK synth → CloudFormation JSON → boto3 deploy
 └── core/
-    ├── config.py            # AWSConfig dataclass, Fargate CPU/memory mapping, client factories, stack loader
-    ├── containers.py        # ECS task lifecycle (register, run, wait, stop)
-    └── exec.py              # Command execution + file transfer via S3 command channel
-infrastructure/cdk/
-├── cdk.json                 # For `cdk deploy` users
-├── app.py                   # Imports from harbor_aws.cdk.stack
-└── requirements.txt
+    ├── config.py            # AWSConfig dataclass, k8s client factory, stack loader
+    ├── pods.py              # Kubernetes pod lifecycle (create, wait, delete)
+    ├── exec.py              # Command execution via Kubernetes WebSocket exec
+    └── files.py             # File transfer via tar-over-exec
 ```
 
 ## Quick Start
@@ -41,16 +39,18 @@ infrastructure/cdk/
 # Install
 pip install -e ".[cdk]"
 
-# Deploy infrastructure (one-time, ~3-5 minutes)
+# Deploy infrastructure (one-time, ~15-20 minutes for EKS)
 python -m harbor_aws deploy --region us-east-1
 
 # Run benchmarks
 harbor trials start -p ./task \
-  --environment-import-path harbor_aws.environment:AWSEnvironment
+  --environment-import-path harbor_aws.environment:AWSEnvironment \
+  --ek stack_name=harbor-aws
 
-# Check status / tear down
+# Check status / clean up / tear down
 python -m harbor_aws status
-python -m harbor_aws destroy
+python -m harbor_aws stop      # delete pods, keep infra
+python -m harbor_aws destroy   # delete everything
 ```
 
 ## Build & Dev
@@ -64,8 +64,8 @@ mypy src/
 
 ## Conventions
 
-- Python 3.12+, async/await throughout (boto3 via `asyncio.to_thread()`)
-- `tenacity` for retries on AWS API calls
+- Python 3.12+, async/await throughout (boto3 + kubernetes client via `asyncio.to_thread()`)
+- `tenacity` for retries on AWS/K8s API calls
 - Strict typing: `mypy --disallow-untyped-defs`, PEP 561
 - Ruff: line-length 120, rules B/E/F/I/N/UP/W
 - `aws-cdk-lib` is an optional dependency (`[cdk]` extra) — only needed for deploy

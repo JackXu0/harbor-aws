@@ -1,9 +1,9 @@
 """CLI entry point: python -m harbor_aws <command>
 
 Commands:
-    deploy   - Create harbor-aws infrastructure in your AWS account
+    deploy   - Create harbor-aws EKS infrastructure in your AWS account
     status   - Check if infrastructure is deployed
-    stop     - Stop all running tasks (keeps infrastructure)
+    stop     - Delete all running pods (keeps infrastructure)
     destroy  - Tear down everything
 """
 
@@ -18,7 +18,7 @@ import sys
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="harbor-aws",
-        description="Harbor AWS — manage ECS/Fargate infrastructure for benchmarks",
+        description="Harbor AWS — manage EKS/Fargate infrastructure for benchmarks",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
 
@@ -37,7 +37,7 @@ def main() -> None:
     status_p.add_argument("--profile", default=None)
 
     # stop
-    stop_p = sub.add_parser("stop", help="stop all running tasks (keeps infrastructure)")
+    stop_p = sub.add_parser("stop", help="delete all running pods (keeps infrastructure)")
     stop_p.add_argument("--stack-name", default="harbor-aws")
     stop_p.add_argument("--region", default="us-east-1")
     stop_p.add_argument("--profile", default=None)
@@ -56,6 +56,7 @@ def main() -> None:
         format="%(message)s",
     )
     logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("kubernetes").setLevel(logging.WARNING)
 
     if args.command == "deploy":
         asyncio.run(_deploy(args))
@@ -109,21 +110,32 @@ async def _status(args: argparse.Namespace) -> None:
 
 
 async def _stop(args: argparse.Namespace) -> None:
-    import boto3
+    from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
+    from harbor_aws.core.pods import delete_pod, list_pods
 
-    session = boto3.Session(profile_name=args.profile, region_name=args.region)
-    await _cleanup_ecs(session, args.stack_name)
-    await _cleanup_task_definitions(session, args.stack_name)
-    print("Cleaned up running tasks. Infrastructure ready for next run.")
+    config = await load_config_from_stack(
+        stack_name=args.stack_name,
+        region=args.region,
+        profile_name=args.profile,
+    )
+    api = create_k8s_client(config)
+
+    pod_names = await list_pods(api, config)
+    if not pod_names:
+        print("No running pods.")
+        return
+
+    for name in pod_names:
+        await delete_pod(api, config, name)
+    print(f"Deleted {len(pod_names)} pod(s). Infrastructure ready for next run.")
 
 
 async def _destroy(args: argparse.Namespace) -> None:
     import boto3
 
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
-
-    # Read stack outputs before deleting so we can clean up retained resources
     cfn = session.client("cloudformation")
+
     try:
         response = cfn.describe_stacks(StackName=args.stack_name)
         stack = response["Stacks"][0]
@@ -134,11 +146,10 @@ async def _destroy(args: argparse.Namespace) -> None:
             return
         raise
 
-    # Show what will be cleaned up
     print(f"This will delete all harbor-aws resources in {args.region}:")
     print(f"  Stack:      {args.stack_name}")
-    if outputs.get("ClusterName"):
-        print(f"  ECS:        cluster '{outputs['ClusterName']}' (+ stop running tasks)")
+    if outputs.get("EksClusterName"):
+        print(f"  EKS:        cluster '{outputs['EksClusterName']}' (+ delete pods)")
     print(f"  + VPC, IAM roles, log groups, dashboard")
 
     if not args.yes:
@@ -147,64 +158,19 @@ async def _destroy(args: argparse.Namespace) -> None:
             print("Cancelled.")
             return
 
-    # 1. Stop all running ECS tasks in the cluster
-    if outputs.get("ClusterName"):
-        await _cleanup_ecs(session, outputs["ClusterName"])
+    # 1. Delete all pods in the namespace
+    try:
+        await _stop(args)
+    except Exception:
+        pass
 
     # 2. Delete the CloudFormation stack
-    print("Deleting CloudFormation stack...")
+    print("Deleting CloudFormation stack (this may take 10-15 minutes for EKS)...")
     cfn.delete_stack(StackName=args.stack_name)
     waiter = cfn.get_waiter("stack_delete_complete")
-    waiter.wait(StackName=args.stack_name, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
-
-    # 3. Deregister orphaned task definitions
-    await _cleanup_task_definitions(session, args.stack_name)
+    waiter.wait(StackName=args.stack_name, WaiterConfig={"Delay": 15, "MaxAttempts": 120})
 
     print("All resources cleaned up.")
-
-
-async def _cleanup_ecs(session: object, cluster_name: str) -> None:
-    """Stop all running tasks in the cluster."""
-    import asyncio as aio
-
-    ecs = session.client("ecs")  # type: ignore[union-attr]
-
-    def _stop_tasks() -> int:
-        count = 0
-        paginator = ecs.get_paginator("list_tasks")
-        for page in paginator.paginate(cluster=cluster_name, desiredStatus="RUNNING"):
-            task_arns = page.get("taskArns", [])
-            for arn in task_arns:
-                ecs.stop_task(cluster=cluster_name, task=arn, reason="harbor-aws destroy")
-                count += 1
-        return count
-
-    count = await aio.to_thread(_stop_tasks)
-    if count:
-        print(f"  Stopped {count} running task(s).")
-
-
-async def _cleanup_task_definitions(session: object, stack_prefix: str) -> None:
-    """Deregister task definitions created by harbor-aws."""
-    import asyncio as aio
-
-    ecs = session.client("ecs")  # type: ignore[union-attr]
-
-    def _deregister() -> int:
-        count = 0
-        try:
-            paginator = ecs.get_paginator("list_task_definitions")
-            for page in paginator.paginate(familyPrefix=f"harbor-aws-", status="ACTIVE"):
-                for arn in page.get("taskDefinitionArns", []):
-                    ecs.deregister_task_definition(taskDefinition=arn)
-                    count += 1
-        except Exception:
-            pass
-        return count
-
-    count = await aio.to_thread(_deregister)
-    if count:
-        print(f"  ECS: deregistered {count} task definition(s).")
 
 
 if __name__ == "__main__":
