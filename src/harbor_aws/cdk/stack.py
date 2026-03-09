@@ -13,6 +13,7 @@ from aws_cdk import (
     aws_ecs as ecs,
     aws_iam as iam,
     aws_logs as logs,
+    aws_s3 as s3,
 )
 
 
@@ -27,6 +28,7 @@ class HarborAWSStack(cdk.Stack):
     - ECS Cluster (Fargate only = $0 idle)
     - IAM Roles (task execution, task)
     - CloudWatch Log Group (7-day retention)
+    - S3 Bucket (command channel and file transfer)
     - CloudWatch Dashboard (ECS + Bedrock metrics)
     """
 
@@ -81,9 +83,6 @@ class HarborAWSStack(cdk.Stack):
             cluster_name=stack_prefix,
             vpc=vpc,
             container_insights_v2=ecs.ContainerInsights.ENABLED,
-            execute_command_configuration=ecs.ExecuteCommandConfiguration(
-                logging=ecs.ExecuteCommandLogging.DEFAULT,
-            ),
         )
 
         # ============================================================
@@ -116,18 +115,6 @@ class HarborAWSStack(cdk.Stack):
         )
         task_role.add_to_policy(
             iam.PolicyStatement(
-                sid="SSMForECSExec",
-                actions=[
-                    "ssmmessages:CreateControlChannel",
-                    "ssmmessages:CreateDataChannel",
-                    "ssmmessages:OpenControlChannel",
-                    "ssmmessages:OpenDataChannel",
-                ],
-                resources=["*"],
-            )
-        )
-        task_role.add_to_policy(
-            iam.PolicyStatement(
                 sid="CloudWatchLogs",
                 actions=["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"],
                 resources=[f"arn:aws:logs:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:log-group:/harbor-aws/*"],
@@ -145,6 +132,29 @@ class HarborAWSStack(cdk.Stack):
                     f"arn:aws:bedrock:*:{cdk.Aws.ACCOUNT_ID}:application-inference-profile/*",
                     "arn:aws:bedrock:*::foundation-model/*",
                 ],
+            )
+        )
+
+        # ============================================================
+        # S3 Bucket — command channel and file transfer
+        # ============================================================
+
+        bucket = s3.Bucket(
+            self,
+            "Bucket",
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+            lifecycle_rules=[
+                s3.LifecycleRule(expiration=cdk.Duration.days(7)),
+            ],
+        )
+
+        # Grant S3 access to both the task role (container daemon) and
+        # the caller (Harbor CLI submits commands from the client side)
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="S3CommandChannel",
+                actions=["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"],
+                resources=[bucket.bucket_arn, f"{bucket.bucket_arn}/*"],
             )
         )
 
@@ -211,6 +221,7 @@ class HarborAWSStack(cdk.Stack):
 
         public_subnets = vpc.select_subnets(subnet_type=ec2.SubnetType.PUBLIC)
 
+        cdk.CfnOutput(self, "S3Bucket", value=bucket.bucket_name)
         cdk.CfnOutput(self, "ClusterName", value=cluster.cluster_name)
         cdk.CfnOutput(self, "SubnetIds", value=",".join([s.subnet_id for s in public_subnets.subnets]))
         cdk.CfnOutput(self, "SecurityGroupId", value=sg.security_group_id)

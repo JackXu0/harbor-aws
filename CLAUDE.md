@@ -5,8 +5,9 @@ AWS ECS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 ## Architecture
 
 - **CDK stack** (`src/harbor_aws/cdk/stack.py`) is the single source of truth for infrastructure
+- **S3 command channel**: commands are submitted as JSON to S3, a daemon in the container polls and executes them (no SSM/ECS Exec)
 - **boto3 client library** (`src/harbor_aws/core/`) wraps AWS APIs for running containers
-- **Shared resources**: one stack (VPC, ECS cluster, IAM roles, CloudWatch) reused across all Docker environments
+- **Shared resources**: one stack (VPC, ECS cluster, S3 bucket, IAM roles, CloudWatch) reused across all Docker environments
 - **On-demand Fargate** for max speed; prebuilt Docker images only
 
 ### Cost When Idle: ~$0
@@ -20,13 +21,14 @@ src/harbor_aws/
 ├── __init__.py              # Exports: AWSConfig, AWSEnvironment
 ├── __main__.py              # CLI: python -m harbor_aws deploy|status|destroy
 ├── environment.py           # Harbor BaseEnvironment adapter
+├── daemon.py               # Container-side daemon (polls S3 for commands)
 ├── cdk/
 │   ├── stack.py             # CDK stack (single source of truth for infra)
 │   └── deploy.py            # CDK synth → CloudFormation JSON → boto3 deploy
 └── core/
-    ├── config.py            # AWSConfig dataclass, Fargate CPU/memory mapping, ECS client factory, stack loader
+    ├── config.py            # AWSConfig dataclass, Fargate CPU/memory mapping, client factories, stack loader
     ├── containers.py        # ECS task lifecycle (register, run, wait, stop)
-    └── exec.py              # Command execution + file transfer via ECS Exec/SSM
+    └── exec.py              # Command execution + file transfer via S3 command channel
 infrastructure/cdk/
 ├── cdk.json                 # For `cdk deploy` users
 ├── app.py                   # Imports from harbor_aws.cdk.stack

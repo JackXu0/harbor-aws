@@ -44,7 +44,6 @@ Fully removes everything — running tasks, stack, task definitions. Nothing lef
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - AWS CLI configured with credentials
-- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 
 ## Cost
 
@@ -81,12 +80,15 @@ Options:
 │  Harbor CLI  │────▶│ AWSEnvironment │────▶│ ECS Fargate  │
 │             │     │   (adapter)    │     │ (on-demand)  │
 └─────────────┘     └────────────────┘     └──────────────┘
-                                                  │
-                                            ┌─────┴─────┐
-                                            │ ECS Exec  │
-                                            │  (SSM)    │
-                                            └───────────┘
+                            │                     │
+                            ▼                     ▼
+                     ┌─────────────┐       ┌─────────────┐
+                     │  S3 Bucket  │◀─────▶│   Daemon    │
+                     │  (commands) │       │ (polls S3)  │
+                     └─────────────┘       └─────────────┘
 ```
+
+Commands are submitted as JSON to S3. A daemon in each container polls for commands, executes them, and uploads results back to S3. No SSM or ECS Exec needed.
 
 Infrastructure defined as CDK in `src/harbor_aws/cdk/stack.py`. Deployment synthesizes in-memory and deploys via CloudFormation — no CDK CLI needed.
 

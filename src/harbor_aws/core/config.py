@@ -39,6 +39,10 @@ class AWSConfig:
     task_execution_role_arn: str = ""
     task_role_arn: str = ""
 
+    # S3 for command channel and file transfer
+    s3_bucket: str = ""
+    s3_prefix: str = "harbor-aws/sessions/"
+
     # Stack-based configuration (alternative to individual fields)
     stack_name: str | None = None
 
@@ -49,6 +53,7 @@ class AWSConfig:
             "security_groups": self.security_groups,
             "task_execution_role_arn": self.task_execution_role_arn,
             "task_role_arn": self.task_role_arn,
+            "s3_bucket": self.s3_bucket,
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
@@ -101,6 +106,15 @@ def create_ecs_client(config: AWSConfig) -> object:
     return session.client("ecs")
 
 
+def create_s3_client(config: AWSConfig) -> object:
+    """Create a boto3 S3 client."""
+    session = boto3.Session(
+        region_name=config.region,
+        profile_name=config.profile_name or None,
+    )
+    return session.client("s3")
+
+
 async def load_config_from_stack(
     stack_name: str,
     region: str = "us-east-1",
@@ -138,6 +152,7 @@ async def load_config_from_stack(
         security_groups=[outputs["SecurityGroupId"]] if "SecurityGroupId" in outputs else [],
         task_execution_role_arn=outputs.get("TaskExecutionRoleArn", ""),
         task_role_arn=outputs.get("TaskRoleArn", ""),
+        s3_bucket=outputs.get("S3Bucket", ""),
     )
 
     config.validate()

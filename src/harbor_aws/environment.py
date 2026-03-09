@@ -11,22 +11,19 @@ from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
 from harbor_aws.core import containers, exec
-from harbor_aws.core.config import AWSConfig, create_ecs_client, load_config_from_stack
+from harbor_aws.core.config import AWSConfig, create_ecs_client, create_s3_client, load_config_from_stack
 
 
 class AWSEnvironment(BaseEnvironment):
     """AWS ECS/Fargate implementation for Harbor sandboxes.
 
-    Runs each sandbox as a Fargate task with ECS Exec for command execution.
-    Uses prebuilt Docker images. File transfer uses base64-over-exec.
+    Runs each sandbox as a Fargate task. Commands are executed via an S3
+    command channel — no SSM/ECS Exec needed. File transfer also goes
+    through S3.
 
     Configuration can be provided either:
     1. Directly via kwargs (subnets, security_groups, etc.)
     2. Via stack_name to auto-read from CloudFormation stack outputs
-
-    Usage with Harbor CLI:
-        harbor trials start -p ./task \\
-            --environment-import-path harbor_aws.environment:AWSEnvironment
     """
 
     def __init__(
@@ -46,6 +43,7 @@ class AWSEnvironment(BaseEnvironment):
         assign_public_ip: bool = True,
         task_execution_role_arn: str = "",
         task_role_arn: str = "",
+        s3_bucket: str = "",
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -74,17 +72,18 @@ class AWSEnvironment(BaseEnvironment):
             assign_public_ip=assign_public_ip,
             task_execution_role_arn=task_execution_role_arn,
             task_role_arn=task_role_arn,
+            s3_bucket=s3_bucket,
         )
 
         self._ecs_client: object | None = None
+        self._s3_client: object | None = None
         self._task_arn: str | None = None
         self._task_definition_arn: str | None = None
+        self._s3_prefix: str = ""
         self._config_loaded = bool(subnet_list)
 
     @staticmethod
     def type() -> EnvironmentType:
-        # Return a string value; Harbor's import_path mechanism doesn't
-        # require this to be in the EnvironmentType enum
         return EnvironmentType("ecs")
 
     @property
@@ -123,14 +122,15 @@ class AWSEnvironment(BaseEnvironment):
         """Initialize boto3 clients."""
         if self._ecs_client is None:
             self._ecs_client = create_ecs_client(self._aws_config)
+        if self._s3_client is None:
+            self._s3_client = create_s3_client(self._aws_config)
 
     async def start(self, force_build: bool) -> None:
-        """Start an ECS Fargate task."""
-        # Validate session-manager-plugin is available
-        await exec.check_session_manager_plugin()
-
+        """Start an ECS Fargate task with the S3 command daemon."""
         await self._ensure_config()
         self._ensure_clients()
+
+        self._s3_prefix = f"{self._aws_config.s3_prefix}{self.session_id}/"
 
         # Use prebuilt image from benchmark config
         image_uri = self.task_env_config.docker_image
@@ -141,12 +141,13 @@ class AWSEnvironment(BaseEnvironment):
             )
         self.logger.debug("Using image: %s", image_uri)
 
-        # Register task definition
+        # Register task definition (injects daemon into entrypoint)
         self._task_definition_arn = await containers.register_task_definition(
             self._ecs_client,
             self._aws_config,
             image_uri,
             self.environment_name,
+            self.session_id,
             cpus=self.task_env_config.cpus,
             memory_mb=self.task_env_config.memory_mb,
         )
@@ -159,12 +160,16 @@ class AWSEnvironment(BaseEnvironment):
             self.session_id,
         )
 
-        # Wait for task and ECS Exec agent to be ready
+        # Wait for task to be running
         await containers.wait_for_task_running(
             self._ecs_client,
             self._aws_config,
             self._task_arn,
         )
+
+        # Wait a few seconds for daemon to start and be ready to accept commands
+        import asyncio
+        await asyncio.sleep(5)
 
         # Create required log directories
         mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
@@ -191,6 +196,7 @@ class AWSEnvironment(BaseEnvironment):
             self._task_arn = None
             self._task_definition_arn = None
             self._ecs_client = None
+            self._s3_client = None
 
     async def exec(
         self,
@@ -199,13 +205,14 @@ class AWSEnvironment(BaseEnvironment):
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
     ) -> ExecResult:
-        """Execute a command in the Fargate task via ECS Exec."""
+        """Execute a command in the Fargate task via S3 command channel."""
         if not self._task_arn:
             raise RuntimeError("Task not running. Call start() first.")
 
         stdout, stderr, return_code = await exec.exec_command(
-            config=self._aws_config,
-            task_arn=self._task_arn,
+            s3_client=self._s3_client,
+            bucket=self._aws_config.s3_bucket,
+            s3_prefix=self._s3_prefix,
             command=command,
             cwd=cwd,
             env=env,
@@ -219,38 +226,31 @@ class AWSEnvironment(BaseEnvironment):
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        """Upload a file to the container."""
-        await exec.upload_file(self._exec_fn, Path(source_path), target_path)
+        """Upload a file to the container via S3."""
+        await exec.upload_file(
+            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
+            Path(source_path), target_path,
+        )
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        """Upload a directory to the container."""
-        await exec.upload_dir(self._exec_fn, Path(source_dir), target_dir)
+        """Upload a directory to the container via S3."""
+        await exec.upload_dir(
+            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
+            Path(source_dir), target_dir,
+        )
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        """Download a file from the container."""
-        await exec.download_file(self._exec_fn, source_path, Path(target_path))
+        """Download a file from the container via S3."""
+        await exec.download_file(
+            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
+            source_path, Path(target_path),
+        )
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        """Download a directory from the container."""
-        await exec.download_dir(self._exec_fn, source_dir, Path(target_dir))
-
-    async def _exec_fn(
-        self,
-        command: str,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_sec: int | None = None,
-    ) -> tuple[str | None, str | None, int]:
-        """Bound exec function for file transfer operations."""
-        if not self._task_arn:
-            raise RuntimeError("Task not running.")
-        return await exec.exec_command(
-            config=self._aws_config,
-            task_arn=self._task_arn,
-            command=command,
-            cwd=cwd,
-            env=env,
-            timeout_sec=timeout_sec,
+        """Download a directory from the container via S3."""
+        await exec.download_dir(
+            self._s3_client, self._aws_config.s3_bucket, self._s3_prefix,
+            source_dir, Path(target_dir),
         )
 
 

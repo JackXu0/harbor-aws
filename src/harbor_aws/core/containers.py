@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import importlib.resources
 import logging
 
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
@@ -22,17 +24,41 @@ async def register_task_definition(
     config: AWSConfig,
     image_uri: str,
     environment_name: str,
+    session_id: str,
     cpus: int,
     memory_mb: int,
     env_vars: dict[str, str] | None = None,
 ) -> str:
     """Register an ECS task definition for Fargate.
 
+    Injects the harbor daemon into the container entrypoint. The daemon
+    polls S3 for commands and executes them.
+
     Returns the task definition ARN.
     """
     fargate_cpu, fargate_memory = map_to_fargate_resources(cpus, memory_mb)
 
-    container_env = [{"name": k, "value": v} for k, v in (env_vars or {}).items()]
+    # Read daemon source and encode for injection into container command
+    daemon_src = importlib.resources.files("harbor_aws").joinpath("daemon.py").read_text()
+    daemon_b64 = base64.b64encode(daemon_src.encode()).decode()
+
+    # Container entrypoint: decode daemon, run it in background, then sleep.
+    # swe-bench images use conda so python3 may not be on the default PATH.
+    entrypoint_cmd = (
+        f"echo '{daemon_b64}' | base64 -d > /tmp/_harbor_daemon.py && "
+        f"PYTHON=$(which python3 2>/dev/null || which python 2>/dev/null "
+        f"|| echo /opt/conda/bin/python) && "
+        f"$PYTHON /tmp/_harbor_daemon.py &\n"
+        f"sleep infinity"
+    )
+
+    s3_prefix = f"{config.s3_prefix}{session_id}/"
+    container_env = [
+        {"name": "HARBOR_S3_BUCKET", "value": config.s3_bucket},
+        {"name": "HARBOR_S3_PREFIX", "value": s3_prefix},
+        {"name": "AWS_DEFAULT_REGION", "value": config.region},
+    ]
+    container_env.extend({"name": k, "value": v} for k, v in (env_vars or {}).items())
 
     import re
 
@@ -50,7 +76,8 @@ async def register_task_definition(
             {
                 "name": "main",
                 "image": image_uri,
-                "command": ["sleep", "infinity"],
+                "entryPoint": ["bash", "-c"],
+                "command": [entrypoint_cmd],
                 "essential": True,
                 "environment": container_env,
                 "linuxParameters": {
@@ -90,7 +117,7 @@ async def run_task(
     task_definition_arn: str,
     session_id: str,
 ) -> str:
-    """Run a Fargate task with ECS Exec enabled.
+    """Run a Fargate task.
 
     Returns the task ARN.
     """
@@ -108,7 +135,6 @@ async def run_task(
         taskDefinition=task_definition_arn,
         launchType="FARGATE",
         networkConfiguration=network_config,
-        enableExecuteCommand=True,
         count=1,
         tags=[
             {"key": "harbor-session", "value": session_id},
@@ -136,7 +162,7 @@ async def wait_for_task_running(
     task_arn: str,
     timeout_sec: int = 300,
 ) -> None:
-    """Wait for task to reach RUNNING state with ECS Exec agent ready."""
+    """Wait for task to reach RUNNING state."""
     logger.debug("Waiting for task %s to be running...", task_arn)
 
     for elapsed in range(0, timeout_sec, 5):
@@ -154,25 +180,14 @@ async def wait_for_task_running(
         status = task.get("lastStatus", "UNKNOWN")
 
         if status == "RUNNING":
-            # Check if ECS Exec agent is ready
-            containers = task.get("containers", [])
-            for container in containers:
-                managed_agents = container.get("managedAgents", [])
-                for agent in managed_agents:
-                    if agent.get("name") == "ExecuteCommandAgent":
-                        if agent.get("lastStatus") == "RUNNING":
-                            logger.debug("Task %s is running with ECS Exec ready", task_arn)
-                            return
-
-            # ECS Exec agent may not be ready yet, wait
-            if elapsed % 15 == 0:
-                logger.debug("Task running, waiting for ECS Exec agent... (%ds)", elapsed)
+            logger.debug("Task %s is running", task_arn)
+            return
 
         elif status in ("STOPPED", "DEPROVISIONING"):
             stop_reason = task.get("stoppedReason", "unknown")
-            containers = task.get("containers", [])
+            task_containers = task.get("containers", [])
             container_reasons = []
-            for c in containers:
+            for c in task_containers:
                 if c.get("reason"):
                     container_reasons.append(f"{c['name']}: {c['reason']}")
             details = "; ".join(container_reasons) if container_reasons else stop_reason
