@@ -25,19 +25,75 @@ uv sync --extra cdk
 # 2. Deploy infrastructure (one-time, ~15 min)
 uv run python -m harbor_aws deploy
 
-# 3. Run a benchmark
-uv run harbor run \
+# 3. Run benchmarks (using job config)
+uv run harbor run -c job-config.yaml \
   -d terminal-bench@2.0 \
-  -a swe-agent \
-  -m bedrock/anthropic.claude-sonnet-4-20250514-v1:0 \
-  -n 89 \
-  --environment-import-path harbor_aws.environment:AWSEnvironment
+  -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 \
+  -n 89
 
-# 4. Tear down when done
-uv run python -m harbor_aws destroy
+# 4. Check status / clean up / tear down
+uv run python -m harbor_aws status
+uv run python -m harbor_aws stop       # delete pods, keep infra
+uv run python -m harbor_aws destroy    # delete everything
+```
+
+The `job-config.yaml` wires up the AWS environment so you don't need `--environment-import-path` every time:
+
+```yaml
+environment:
+  import_path: "harbor_aws.environment:AWSEnvironment"
+  kwargs:
+    stack_name: harbor-aws
+    region: us-east-1
 ```
 
 **Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/), an AWS account with admin access, and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
+
+## Benchmark Examples
+
+All benchmarks below use [Kimi K2.5](https://arxiv.org/abs/2504.05861) via Amazon Bedrock with the [terminus-2](https://github.com/harbor-framework/terminus-2) agent at maximum concurrency.
+
+```bash
+# Terminal-Bench 2.0 (89 tasks)
+uv run harbor run -c job-config.yaml \
+  -d terminal-bench@2.0 -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 -n 89
+
+# SWE-bench Verified (500 tasks)
+uv run harbor run -c job-config.yaml \
+  -d swebenchverified@1.0 -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 -n 500
+
+# GPQA-Diamond (198 tasks)
+uv run harbor run -c job-config.yaml \
+  -d gpqa-diamond@1.0 -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 -n 198
+
+# LiveCodeBench v6 (100 tasks)
+uv run harbor run -c job-config.yaml \
+  -d livecodebench@6.0 -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 -n 100
+
+# SWE-bench Pro (731 tasks)
+uv run harbor run -c job-config.yaml \
+  -d swebenchpro@1.0 -a terminus-2 \
+  -m bedrock/converse/moonshotai.kimi-k2.5 -n 731
+```
+
+## Validation Results
+
+We ran the benchmarks from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) to validate harbor-aws against official scores. All runs used Kimi K2.5 on Bedrock with terminus-2 at full concurrency.
+
+| Benchmark | Official (Kimi K2.5) | harbor-aws | Agent | Notes |
+|---|---|---|---|---|
+| SWE-bench Verified | 76.8% (internal agent) | 71.5% | terminus-2 | Official used internal agent, not terminus-2 |
+| Terminal-Bench 2.0 | 50.8% | 43.8% | terminus-2 | Official used terminus-2 |
+| GPQA-Diamond | 87.6% | 79.8% | terminus-2 | |
+| LiveCodeBench v6 | 85.0% | 88.6% | terminus-2 | Exceeds official score |
+| SWE-bench Pro | 50.7% (internal agent) | _in progress_ | terminus-2 | |
+
+> **Note:** Score differences are expected. Official Kimi K2.5 results used their internal agent for SWE-bench tasks, while we use the open-source terminus-2 agent throughout. LiveCodeBench v6 exceeded the official score. GPQA-Diamond and Terminal-Bench 2.0 gaps likely reflect agent differences rather than infrastructure issues.
 
 ## Cost
 
