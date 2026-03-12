@@ -1,0 +1,5 @@
+environment:
+  import_path: "harbor_aws.environment:AWSEnvironment"
+  kwargs:
+    stack_name: harbor-aws
+    region: us-east-1

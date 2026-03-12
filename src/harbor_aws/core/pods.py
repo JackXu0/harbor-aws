@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import traceback
 
 from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
@@ -28,6 +29,7 @@ async def create_pod(
     cpus: int,
     memory_mb: int,
     env_vars: dict[str, str] | None = None,
+    image_pull_secret: str | None = None,
 ) -> str:
     """Create a Kubernetes pod for a benchmark task.
 
@@ -60,20 +62,28 @@ async def create_pod(
                     command=["sleep", "infinity"],
                     env=container_env or None,
                     resources=client.V1ResourceRequirements(
-                        requests={"cpu": str(cpus), "memory": f"{memory_mb}Mi"},
-                        limits={"cpu": str(cpus), "memory": f"{memory_mb}Mi"},
+                        requests={"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"},
+                        limits={"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"},
                     ),
                 ),
             ],
+            service_account_name="harbor-pod",
             restart_policy="Never",
+            image_pull_secrets=[client.V1LocalObjectReference(name=image_pull_secret)] if image_pull_secret else None,
         ),
     )
 
-    await asyncio.to_thread(
-        api.create_namespaced_pod,
-        namespace=config.namespace,
-        body=pod,
-    )
+    try:
+        await asyncio.to_thread(
+            api.create_namespaced_pod,
+            namespace=config.namespace,
+            body=pod,
+        )
+    except client.ApiException as e:
+        if e.status == 409:
+            logger.debug("Pod %s already exists, reusing", pod_name)
+        else:
+            raise
 
     logger.debug("Created pod: %s (image=%s, cpu=%d, memory=%dMi)", pod_name, image_uri, cpus, memory_mb)
     return pod_name
@@ -83,30 +93,58 @@ async def wait_for_pod_running(
     api: client.CoreV1Api,
     config: AWSConfig,
     pod_name: str,
-    timeout_sec: int = 300,
+    timeout_sec: int = 1800,
 ) -> None:
-    """Wait for pod to reach Running phase."""
+    """Wait for pod to reach Running phase and be ready for exec."""
     logger.debug("Waiting for pod %s to be running...", pod_name)
 
     for elapsed in range(0, timeout_sec, 5):
-        pod = await asyncio.to_thread(
-            api.read_namespaced_pod_status,
-            name=pod_name,
-            namespace=config.namespace,
-        )
+        try:
+            pod = await asyncio.to_thread(
+                api.read_namespaced_pod_status,
+                name=pod_name,
+                namespace=config.namespace,
+            )
+        except Exception as e:
+            logger.error(
+                "[wait] read_namespaced_pod_status FAILED for %s at %ds: %s: %s\n%s",
+                pod_name, elapsed, type(e).__name__, str(e)[:300], traceback.format_exc(),
+            )
+            raise
 
         phase = pod.status.phase
 
         if phase == "Running":
-            logger.debug("Pod %s is running", pod_name)
-            return
+            # Verify all containers are ready before returning
+            all_ready = True
+            for cs in pod.status.container_statuses or []:
+                if not cs.ready:
+                    all_ready = False
+                    break
+            if all_ready:
+                logger.debug("Pod %s is running and ready", pod_name)
+                return
+            if elapsed % 15 == 0:
+                logger.debug("Pod %s is Running but containers not ready yet (%ds)", pod_name, elapsed)
 
-        if phase in ("Failed", "Succeeded"):
+        elif phase in ("Failed", "Succeeded"):
             reason = _get_pod_failure_reason(pod)
             raise RuntimeError(f"Pod {pod_name} terminated before becoming ready: {reason}")
 
-        if elapsed % 15 == 0:
-            logger.debug("Pod status: %s (%ds elapsed)", phase, elapsed)
+        else:
+            # Detect unrecoverable image pull errors (e.g. no space left on device)
+            for cs in pod.status.container_statuses or []:
+                if cs.state and cs.state.waiting:
+                    wait_msg = cs.state.waiting.message or ""
+                    if "no space left on device" in wait_msg:
+                        raise RuntimeError(f"Pod {pod_name} image pull failed: {wait_msg}")
+
+            if elapsed % 60 == 0:
+                wait_reason = ""
+                for cs in pod.status.container_statuses or []:
+                    if cs.state and cs.state.waiting:
+                        wait_reason = f" ({cs.state.waiting.reason})"
+                logger.debug("Pod %s status: %s%s (%ds elapsed)", pod_name, phase, wait_reason, elapsed)
 
         await asyncio.sleep(5)
 

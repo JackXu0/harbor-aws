@@ -10,18 +10,31 @@ import asyncio
 import json
 import logging
 import os
+import shlex
+import shutil
 import subprocess
 import tempfile
 
 logger = logging.getLogger(__name__)
 
 
+def _find_cdk() -> str:
+    """Find the CDK CLI command. Prefers global 'cdk', falls back to 'npx aws-cdk'."""
+    if shutil.which("cdk"):
+        return "cdk"
+    if shutil.which("npx"):
+        return "npx --registry https://registry.npmjs.org -y aws-cdk"
+    raise RuntimeError("CDK CLI not found. Install with: npm install -g aws-cdk")
+
+
 def _write_cdk_app(stack_prefix: str, out_dir: str) -> str:
     """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
+    # Resolve the src directory so the CDK app can import harbor_aws
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     app_code = f"""\
 import aws_cdk as cdk
 import sys
-sys.path.insert(0, "{os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))}")
+sys.path.insert(0, "{src_dir}")
 from harbor_aws.cdk.stack import HarborAWSStack
 
 app = cdk.App()
@@ -47,15 +60,16 @@ async def deploy(
 ) -> dict[str, str]:
     """Deploy harbor-aws EKS infrastructure. Returns stack outputs.
 
-    Requires: npm install -g aws-cdk
+    Requires: CDK CLI (npm install -g aws-cdk) or npx.
     """
     import boto3
 
     def _deploy() -> dict[str, str]:
         session = boto3.Session(profile_name=profile_name, region_name=region)
+        cdk_cmd = _find_cdk()
 
         # First, bootstrap CDK if needed
-        _ensure_cdk_bootstrap(region, profile_name)
+        _ensure_cdk_bootstrap(region, profile_name, cdk_cmd)
 
         # Deploy via CDK CLI
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -68,13 +82,11 @@ async def deploy(
 
             logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
 
+            app_arg = f"python {os.path.join(tmp_dir, 'app.py')}"
+            cmd = f"{cdk_cmd} deploy --app {shlex.quote(app_arg)} --require-approval never --outputs-file {shlex.quote(os.path.join(tmp_dir, 'outputs.json'))}"
             result = subprocess.run(
-                [
-                    "cdk", "deploy",
-                    "--app", f"python {os.path.join(tmp_dir, 'app.py')}",
-                    "--require-approval", "never",
-                    "--outputs-file", os.path.join(tmp_dir, "outputs.json"),
-                ],
+                cmd,
+                shell=True,
                 cwd=tmp_dir,
                 env=env,
                 capture_output=True,
@@ -101,7 +113,7 @@ async def deploy(
     return await asyncio.to_thread(_deploy)
 
 
-def _ensure_cdk_bootstrap(region: str, profile_name: str | None) -> None:
+def _ensure_cdk_bootstrap(region: str, profile_name: str | None, cdk_cmd: str) -> None:
     """Ensure CDK bootstrap stack exists."""
     import boto3
 
@@ -117,6 +129,10 @@ def _ensure_cdk_bootstrap(region: str, profile_name: str | None) -> None:
         if "does not exist" not in str(e):
             raise
 
+    # Get account ID for bootstrap
+    sts = session.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+
     logger.info("CDK bootstrap not found. Running 'cdk bootstrap'...")
     env = os.environ.copy()
     env["AWS_DEFAULT_REGION"] = region
@@ -124,7 +140,8 @@ def _ensure_cdk_bootstrap(region: str, profile_name: str | None) -> None:
         env["AWS_PROFILE"] = profile_name
 
     result = subprocess.run(
-        ["cdk", "bootstrap", f"aws://unknown-account/{region}"],
+        f"{cdk_cmd} bootstrap aws://{account_id}/{region}",
+        shell=True,
         env=env,
         capture_output=True,
         text=True,

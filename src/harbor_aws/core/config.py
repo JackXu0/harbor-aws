@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 
 import boto3
 
 logger = logging.getLogger(__name__)
+
+# EKS tokens expire after 15 minutes; refresh after 10 minutes to be safe
+_TOKEN_REFRESH_INTERVAL = 600
 
 
 @dataclass
@@ -36,26 +41,88 @@ class AWSConfig:
             )
 
 
-def create_k8s_client(config: AWSConfig) -> object:
+class _K8sClientCache:
+    """Singleton cache for the Kubernetes API client with automatic token refresh.
+
+    EKS tokens from `aws eks get-token` expire after 15 minutes. This cache
+    recreates the client every 10 minutes to ensure a fresh token.
+    Shared across all AWSEnvironment instances to avoid concurrent refresh issues.
+    """
+
+    _instance = None  # type: _K8sClientCache | None
+    _lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self._api: object | None = None
+        self._created_at: float = 0
+
+    @classmethod
+    def get(cls) -> _K8sClientCache:
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def get_api(self) -> object:
+        with self._lock:
+            if self._api is None or time.monotonic() - self._created_at > _TOKEN_REFRESH_INTERVAL:
+                self._refresh()
+            return self._api
+
+    def _refresh(self) -> None:
+        from kubernetes import client, config as k8s_config
+
+        try:
+            k8s_config.load_kube_config()
+        except Exception as e:
+            logger.error(
+                "Failed to load kubeconfig (AWS credentials may have expired). "
+                "Run 'aws sso login' or refresh credentials, then retry. Error: %s", e,
+            )
+            raise
+        self._api = client.CoreV1Api()
+        self._created_at = time.monotonic()
+        logger.debug("Refreshed Kubernetes API client token")
+
+
+class RefreshableCoreV1Api:
+    """Proxy that delegates to a shared, auto-refreshing CoreV1Api client."""
+
+    def __getattr__(self, name: str):
+        return getattr(_K8sClientCache.get().get_api(), name)
+
+
+_kubeconfig_lock = threading.Lock()
+_kubeconfig_initialized = False
+
+
+def create_k8s_client(config: AWSConfig) -> RefreshableCoreV1Api:
     """Create a Kubernetes CoreV1Api client configured for the EKS cluster.
 
     Updates kubeconfig via AWS CLI, then loads it with the kubernetes library.
+    Returns a proxy that auto-refreshes the EKS token before expiry.
+    Thread-safe: only the first call updates kubeconfig.
     """
-    from kubernetes import client, config as k8s_config
+    global _kubeconfig_initialized
 
-    # Update kubeconfig for the EKS cluster
-    cmd = [
-        "aws", "eks", "update-kubeconfig",
-        "--name", config.eks_cluster_name,
-        "--region", config.region,
-    ]
-    if config.profile_name:
-        cmd += ["--profile", config.profile_name]
+    with _kubeconfig_lock:
+        if not _kubeconfig_initialized:
+            cmd = [
+                "aws", "eks", "update-kubeconfig",
+                "--name", config.eks_cluster_name,
+                "--region", config.region,
+            ]
+            if config.profile_name:
+                cmd += ["--profile", config.profile_name]
 
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            _kubeconfig_initialized = True
 
-    k8s_config.load_kube_config()
-    return client.CoreV1Api()
+    # Force an initial token load
+    _K8sClientCache.get().get_api()
+
+    return RefreshableCoreV1Api()
 
 
 async def load_config_from_stack(

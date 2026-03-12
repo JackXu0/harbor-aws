@@ -11,9 +11,9 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_eks as eks,
     aws_iam as iam,
-    aws_lambda as lambda_,
     aws_logs as logs,
 )
+from aws_cdk.lambda_layer_kubectl_v31 import KubectlV31Layer
 
 
 class HarborAWSStack(cdk.Stack):
@@ -23,8 +23,8 @@ class HarborAWSStack(cdk.Stack):
     Pay only for EKS control plane ($0.10/hr) + Fargate pod runtime.
 
     Resources created:
-    - VPC with 2 public subnets (no NAT gateway)
-    - EKS Cluster with Fargate profile
+    - VPC with 2 public + 2 private subnets (1 NAT gateway)
+    - EKS Cluster with Fargate profile (pods run in private subnets)
     - IAM Roles (Fargate pod execution, pod service account)
     - CloudWatch Log Group (7-day retention)
     - CloudWatch Dashboard (EKS + Bedrock metrics)
@@ -45,7 +45,9 @@ class HarborAWSStack(cdk.Stack):
         namespace = "harbor"
 
         # ============================================================
-        # Networking — VPC with public subnets only (no NAT = $0 idle)
+        # Networking — VPC with public + private subnets
+        # Fargate pods must run in private subnets (AWS requirement).
+        # 1 NAT gateway (~$32/mo) for outbound internet from pods.
         # ============================================================
 
         vpc = ec2.Vpc(
@@ -53,12 +55,16 @@ class HarborAWSStack(cdk.Stack):
             "VPC",
             vpc_name=f"{stack_prefix}-vpc",
             max_azs=2,
-            nat_gateways=0,
+            nat_gateways=1,
             subnet_configuration=[
                 ec2.SubnetConfiguration(
                     name="Public",
                     subnet_type=ec2.SubnetType.PUBLIC,
                     map_public_ip_on_launch=True,
+                ),
+                ec2.SubnetConfiguration(
+                    name="Private",
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
                 ),
             ],
         )
@@ -67,24 +73,43 @@ class HarborAWSStack(cdk.Stack):
         # EKS Cluster with Fargate
         # ============================================================
 
-        kubectl_layer = lambda_.LayerVersion.from_layer_version_arn(
-            self,
-            "KubectlLayer",
-            f"arn:aws:lambda:{cdk.Aws.REGION}:602401143452:layer:kubectl-v1-31:1",
-        )
-
         cluster = eks.FargateCluster(
             self,
             "Cluster",
             cluster_name=stack_prefix,
             vpc=vpc,
             version=eks.KubernetesVersion.V1_31,
-            kubectl_layer=kubectl_layer,
-            vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)],
+            kubectl_layer=KubectlV31Layer(self, "KubectlLayer"),
+            vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)],
             endpoint_access=eks.EndpointAccess.PUBLIC,
             default_profile=eks.FargateProfileOptions(
-                selectors=[eks.Selector(namespace=namespace)],
+                selectors=[
+                    eks.Selector(namespace=namespace),
+                    eks.Selector(namespace="kube-system"),
+                ],
             ),
+        )
+
+        # Patch CoreDNS to run on Fargate (remove ec2 compute-type annotation)
+        coredns_patch = cluster.add_manifest(
+            "CoreDnsFargatePatch",
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "coredns",
+                    "namespace": "kube-system",
+                },
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "eks.amazonaws.com/compute-type": "fargate",
+                            },
+                        },
+                    },
+                },
+            },
         )
 
         # ============================================================
@@ -105,6 +130,7 @@ class HarborAWSStack(cdk.Stack):
             "PodServiceAccount",
             name="harbor-pod",
             namespace=namespace,
+            annotations={"eks.amazonaws.com/token-expiration": "43200"},
         )
         pod_sa.node.add_dependency(harbor_ns)
 
