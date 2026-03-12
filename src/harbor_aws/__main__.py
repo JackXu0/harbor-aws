@@ -82,7 +82,7 @@ async def _deploy(args: argparse.Namespace) -> None:
     print("\nStack outputs:")
     for key, value in sorted(outputs.items()):
         print(f"  {key}: {value}")
-    print(f"\nUse with Harbor:\n  harbor trials start -p ./task \\\n    --environment-import-path harbor_aws.environment:AWSEnvironment \\\n    --ek stack_name={args.stack_name} --ek region={args.region}")
+    print(f"\nUse with Harbor:\n  harbor trials start -p ./task \\\n    --environment-import-path harbor_aws.adapter:AWSEnvironment \\\n    --ek stack_name={args.stack_name} --ek region={args.region}")
 
 
 async def _status(args: argparse.Namespace) -> None:
@@ -150,7 +150,7 @@ async def _destroy(args: argparse.Namespace) -> None:
     print(f"  Stack:      {args.stack_name}")
     if outputs.get("EksClusterName"):
         print(f"  EKS:        cluster '{outputs['EksClusterName']}' (+ delete pods)")
-    print(f"  + VPC, IAM roles, log groups, dashboard")
+    print(f"  + VPC, IAM roles, log groups")
 
     if not args.yes:
         confirm = input("\nProceed? [y/N] ")

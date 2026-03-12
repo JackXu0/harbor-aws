@@ -42,7 +42,7 @@ The `job-config.yaml` wires up the AWS environment so you don't need `--environm
 
 ```yaml
 environment:
-  import_path: "harbor_aws.environment:AWSEnvironment"
+  import_path: "harbor_aws.adapter:AWSEnvironment"
   kwargs:
     stack_name: harbor-aws
     region: us-east-1
@@ -72,7 +72,6 @@ To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical r
 
 ```bash
 uv sync --extra dev --extra cdk
-uv run pytest
 uv run ruff check src/
 uv run mypy src/
 ```

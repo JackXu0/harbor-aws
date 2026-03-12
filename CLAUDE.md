@@ -44,7 +44,7 @@ python -m harbor_aws deploy --region us-east-1
 
 # Run benchmarks
 harbor trials start -p ./task \
-  --environment-import-path harbor_aws.environment:AWSEnvironment \
+  --environment-import-path harbor_aws.adapter:AWSEnvironment \
   --ek stack_name=harbor-aws
 
 # Check status / clean up / tear down
@@ -57,7 +57,6 @@ python -m harbor_aws destroy   # delete everything
 
 ```bash
 pip install -e ".[dev,cdk]"
-pytest
 ruff check src/
 mypy src/
 ```
