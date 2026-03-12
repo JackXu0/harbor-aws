@@ -36,29 +36,14 @@ uv run python -m harbor_aws destroy
 
 | Component | Cost |
 |---|---|
-| EKS control plane | ~$73/mo (fixed) |
-| NAT gateway | ~$32/mo (fixed) |
-| Fargate pods | Per-second, only when running |
+| EKS control plane | ~$0.10/hr (fixed) |
+| NAT gateway | ~$0.045/hr (fixed) |
+| Fargate pod (1 vCPU, 4 GB) | ~$0.07/hr per pod |
 | VPC, IAM, CloudWatch | Negligible |
 
-## CLI
+Cost scales linearly with the number of pods and how long they run. Running 500 pods for 2 hours costs roughly the same as running 1 pod for 1,000 hours.
 
-```
-python -m harbor_aws <command> [options]
-
-Commands:
-  deploy    Deploy infrastructure (idempotent)
-  status    Show stack status and outputs
-  stop      Stop all running pods (keeps infrastructure)
-  destroy   Full cleanup — removes everything
-
-Options:
-  --stack-name   Stack name (default: harbor-aws)
-  --region       AWS region (default: us-east-1)
-  --profile      AWS CLI profile
-  -y, --yes      Skip confirmation (destroy only)
-  -v, --verbose  Verbose output
-```
+> **Note:** High-concurrency runs pull many Docker images simultaneously. A [Docker Hub Pro subscription](https://www.docker.com/pricing/) ($5/mo) is recommended to avoid rate limits. AWS credentials must remain valid for the duration of the run (~1 hour expiry by default).
 
 ## Architecture
 
