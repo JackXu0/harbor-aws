@@ -48,11 +48,11 @@ environment:
     region: us-east-1
 ```
 
-**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/), an AWS account with admin access, and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
+**Prerequisites:** An AWS account with admin access and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
 
 ## Validation Results
 
-To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock. All runs used the [terminus-2](https://github.com/harbor-framework/terminus-2) agent at full concurrency.
+To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with the [terminus-2](https://github.com/harbor-framework/terminus-2) agent.
 
 | Benchmark | Official | harbor-aws |
 |---|:---:|:---:|
@@ -61,6 +61,8 @@ To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical r
 | GPQA-Diamond | 87.6% | 79.8% |
 | LiveCodeBench v6 | 85.0% | 88.6% |
 | SWE-bench Pro | 50.7% | _in progress_ |
+
+> Score gaps are expected — official Kimi K2.5 results used their internal agent for some benchmarks (SWE-bench Verified, SWE-bench Pro), while we use terminus-2 throughout.
 
 ## Cost
 
