@@ -1,8 +1,11 @@
 # harbor-aws
 
-AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks.
+AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Run every task in parallel — deploy in one command, pay only when running.
 
-Harbor runs benchmarks locally by default — one task at a time. This package adds an AWS backend so you can run hundreds of tasks in parallel on EKS Fargate.
+- **One-command setup** — `python -m harbor_aws deploy` provisions VPC, EKS, IAM, and logging. No Kubernetes or AWS expertise needed.
+- **Max concurrency** — all tasks across all benchmarks run in parallel. No queuing, no waiting.
+- **Elastic and pay-as-you-go** — Fargate pods spin up on demand and bill per-second. No idle compute.
+- **One-command teardown** — `python -m harbor_aws destroy` removes everything. Nothing left behind.
 
 ## Quick Start
 
