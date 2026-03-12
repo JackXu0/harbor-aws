@@ -43,18 +43,12 @@ uv run python -m harbor_aws destroy
 
 > **Note:** High-concurrency runs pull many Docker images simultaneously. A [Docker Hub Pro subscription](https://www.docker.com/pricing/) ($11/mo) is recommended to avoid rate limits. AWS credentials must remain valid for the duration of the run (~1 hour expiry by default).
 
-## Architecture
+## How It Works
 
-```
-Harbor CLI ──▶ AWSEnvironment ──▶ EKS Fargate pods
-                    │
-              ┌─────┴─────┐
-              │           │
-        WebSocket exec  Tar-over-exec
-         (commands)    (file transfer)
-```
-
-Infrastructure is defined as CDK in `src/harbor_aws/cdk/stack.py` and deployed via CloudFormation — no CDK CLI needed. Commands run via Kubernetes WebSocket exec; file transfer uses tar-over-exec (same as `kubectl cp`).
+1. `python -m harbor_aws deploy` creates a shared EKS cluster and networking via CloudFormation.
+2. When Harbor runs a benchmark, each task gets its own Fargate pod with a prebuilt Docker image.
+3. Harbor executes commands and transfers files to/from pods over Kubernetes WebSocket.
+4. Pods are deleted after each task. The cluster stays up for the next run.
 
 ## Monitoring
 
