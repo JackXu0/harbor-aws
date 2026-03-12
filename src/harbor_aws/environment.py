@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import logging
-import subprocess
 from pathlib import Path
 
 from kubernetes import client
@@ -16,7 +15,7 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from harbor_aws.core import exec, pods
+from harbor_aws.core import exec, files, pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
 
 
@@ -321,28 +320,21 @@ class AWSEnvironment(BaseEnvironment):
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await self._kubectl_cp(str(source_path), f"{self._pod_ref}:{target_path}")
+        await files.upload_file(
+            self._pod_name, self._aws_config.namespace, str(source_path), target_path,
+        )
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await self._kubectl_cp(str(source_dir), f"{self._pod_ref}:{target_dir}")
+        await files.upload_dir(
+            self._pod_name, self._aws_config.namespace, str(source_dir), target_dir,
+        )
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-        await self._kubectl_cp(f"{self._pod_ref}:{source_path}", str(target_path))
+        await files.download_file(
+            self._pod_name, self._aws_config.namespace, source_path, str(target_path),
+        )
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        Path(target_dir).mkdir(parents=True, exist_ok=True)
-        await self._kubectl_cp(f"{self._pod_ref}:{source_dir}", str(target_dir))
-
-    @property
-    def _pod_ref(self) -> str:
-        """Kubernetes pod reference for kubectl: namespace/pod-name."""
-        return f"{self._aws_config.namespace}/{self._pod_name}"
-
-    async def _kubectl_cp(self, src: str, dst: str) -> None:
-        cmd = ["kubectl", "cp", src, dst, "-c", "main"]
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=120,
+        await files.download_dir(
+            self._pod_name, self._aws_config.namespace, source_dir, str(target_dir),
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"kubectl cp failed: {result.stderr.strip()}")
