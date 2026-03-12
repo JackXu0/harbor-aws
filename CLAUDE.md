@@ -7,7 +7,7 @@ AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 - **CDK stack** (`src/harbor_aws/cdk/stack.py`) is the single source of truth for infrastructure
 - **Kubernetes exec**: commands run via WebSocket exec (same as `kubectl exec`) — no daemon, no polling
 - **Tar-over-exec** for file transfer (same mechanism as `kubectl cp`)
-- **Shared resources**: one stack (VPC, EKS cluster, IAM roles, CloudWatch) reused across all benchmark environments
+- **Shared resources**: one stack (VPC, EKS cluster, IAM roles) reused across all benchmark environments
 - **EKS Fargate** for serverless pods; prebuilt Docker images only
 
 ### Cost

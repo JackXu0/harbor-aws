@@ -50,15 +50,6 @@ uv run python -m harbor_aws destroy
 3. Harbor executes commands and transfers files to/from pods over Kubernetes WebSocket.
 4. Pods are deleted after each task. The cluster stays up for the next run.
 
-## Monitoring
-
-A CloudWatch dashboard (`harbor-aws-monitor`) is created automatically:
-
-- **EKS Fargate** — pod count, CPU, memory
-- **Bedrock** — tokens, invocations, errors, throttles, latency per model
-
-Pod logs: CloudWatch Logs at `/harbor-aws/harbor-aws` (7-day retention).
-
 ## Development
 
 ```bash

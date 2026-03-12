@@ -7,7 +7,6 @@ from constructs import Construct
 
 import aws_cdk as cdk
 from aws_cdk import (
-    aws_cloudwatch as cloudwatch,
     aws_ec2 as ec2,
     aws_eks as eks,
     aws_iam as iam,
@@ -27,7 +26,6 @@ class HarborAWSStack(cdk.Stack):
     - EKS Cluster with Fargate profile (pods run in private subnets)
     - IAM Roles (Fargate pod execution, pod service account)
     - CloudWatch Log Group (7-day retention)
-    - CloudWatch Dashboard (EKS + Bedrock metrics)
     """
 
     def __init__(
@@ -170,81 +168,9 @@ class HarborAWSStack(cdk.Stack):
         )
 
         # ============================================================
-        # CloudWatch Dashboard
-        # ============================================================
-
-        dashboard = cloudwatch.Dashboard(
-            self,
-            "Dashboard",
-            dashboard_name=f"{stack_prefix}-monitor",
-            default_interval=cdk.Duration.hours(3),
-        )
-
-        # --- EKS/Fargate Pod Metrics ---
-        dashboard.add_widgets(cloudwatch.TextWidget(markdown="# EKS Fargate", width=24, height=1))
-
-        pod_count = cloudwatch.Metric(
-            namespace="ContainerInsights",
-            metric_name="pod_number_of_running_pods",
-            dimensions_map={"ClusterName": cluster.cluster_name},
-            statistic="Maximum",
-            period=cdk.Duration.minutes(1),
-        )
-        dashboard.add_widgets(
-            cloudwatch.GraphWidget(title="Running Pods", left=[pod_count], width=24, height=6),
-        )
-
-        cpu_metric = cloudwatch.Metric(
-            namespace="ContainerInsights",
-            metric_name="pod_cpu_utilization",
-            dimensions_map={"ClusterName": cluster.cluster_name},
-            statistic="Average",
-            period=cdk.Duration.minutes(1),
-        )
-        memory_metric = cloudwatch.Metric(
-            namespace="ContainerInsights",
-            metric_name="pod_memory_utilization",
-            dimensions_map={"ClusterName": cluster.cluster_name},
-            statistic="Average",
-            period=cdk.Duration.minutes(1),
-        )
-        dashboard.add_widgets(
-            cloudwatch.GraphWidget(title="Pod CPU Utilization", left=[cpu_metric], width=12, height=6),
-            cloudwatch.GraphWidget(title="Pod Memory Utilization", left=[memory_metric], width=12, height=6),
-        )
-
-        # --- Bedrock ---
-        dashboard.add_widgets(cloudwatch.TextWidget(markdown="# Bedrock", width=24, height=1))
-
-        def _bedrock_search(metric_name: str, stat: str = "Sum") -> cloudwatch.MathExpression:
-            return cloudwatch.MathExpression(
-                expression=f"SEARCH('{{AWS/Bedrock,ModelId}} MetricName=\"{metric_name}\"', '{stat}', 60)",
-                label=metric_name,
-                period=cdk.Duration.minutes(1),
-            )
-
-        dashboard.add_widgets(
-            cloudwatch.GraphWidget(title="Input Tokens by Model", left=[_bedrock_search("InputTokenCount")], width=12, height=6),
-            cloudwatch.GraphWidget(title="Output Tokens by Model", left=[_bedrock_search("OutputTokenCount")], width=12, height=6),
-        )
-        dashboard.add_widgets(
-            cloudwatch.GraphWidget(title="Invocations by Model", left=[_bedrock_search("Invocations")], width=8, height=6),
-            cloudwatch.GraphWidget(title="Errors by Model", left=[_bedrock_search("InvocationClientErrors")], width=8, height=6),
-            cloudwatch.GraphWidget(title="Throttles by Model", left=[_bedrock_search("InvocationThrottles")], width=8, height=6),
-        )
-        dashboard.add_widgets(
-            cloudwatch.GraphWidget(title="Latency by Model (ms)", left=[_bedrock_search("InvocationLatency", "Average")], width=24, height=6),
-        )
-
-        # ============================================================
         # Outputs
         # ============================================================
 
         cdk.CfnOutput(self, "EksClusterName", value=cluster.cluster_name)
         cdk.CfnOutput(self, "Namespace", value=namespace)
         cdk.CfnOutput(self, "Region", value=cdk.Aws.REGION)
-        cdk.CfnOutput(
-            self,
-            "DashboardURL",
-            value=f"https://{cdk.Aws.REGION}.console.aws.amazon.com/cloudwatch/home?region={cdk.Aws.REGION}#dashboards:name={stack_prefix}-monitor",
-        )
