@@ -41,9 +41,7 @@ uv run python -m harbor_aws destroy
 | Fargate pod (1 vCPU, 4 GB) | ~$0.07/hr per pod |
 | VPC, IAM, CloudWatch | Negligible |
 
-Cost scales linearly with the number of pods and how long they run. Running 500 pods for 2 hours costs roughly the same as running 1 pod for 1,000 hours.
-
-> **Note:** High-concurrency runs pull many Docker images simultaneously. A [Docker Hub Pro subscription](https://www.docker.com/pricing/) ($5/mo) is recommended to avoid rate limits. AWS credentials must remain valid for the duration of the run (~1 hour expiry by default).
+> **Note:** High-concurrency runs pull many Docker images simultaneously. A [Docker Hub Pro subscription](https://www.docker.com/pricing/) ($11/mo) is recommended to avoid rate limits. AWS credentials must remain valid for the duration of the run (~1 hour expiry by default).
 
 ## Architecture
 
