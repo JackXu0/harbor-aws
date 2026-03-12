@@ -1,7 +1,9 @@
-"""File transfer via tar-over-exec (same mechanism as kubectl cp).
+"""File transfer between the orchestrator and pods via tar-over-exec.
 
-Uses the Kubernetes Python client directly instead of shelling out to kubectl,
-avoiding the overhead of spawning hundreds of subprocesses at high concurrency.
+Harbor's BaseEnvironment interface requires upload_file/download_file methods for
+moving test suites, agent scripts, logs, and artifacts between the orchestrator and
+pods. This implements that contract by piping tar archives through Kubernetes
+WebSocket exec — same mechanism as `kubectl cp`.
 """
 
 from __future__ import annotations
