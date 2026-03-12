@@ -114,3 +114,7 @@ uv run pytest
 uv run ruff check src/
 uv run mypy src/
 ```
+
+## License
+
+MIT
