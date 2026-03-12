@@ -2,7 +2,7 @@
 
 AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks.
 
-Deploy once, run any Docker-based benchmark elastically on Fargate. Pay per-second for pods, ~$73/mo fixed for the EKS control plane.
+Harbor runs benchmarks locally by default — one task at a time. This package adds an AWS backend so you can run hundreds of tasks in parallel on EKS Fargate.
 
 ## Quick Start
 
