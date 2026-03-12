@@ -2,54 +2,35 @@
 
 AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Run every task in parallel — deploy in one command, pay only when running.
 
-- **One-command setup** — `python -m harbor_aws deploy` provisions VPC, EKS, IAM, and logging. No Kubernetes or AWS expertise needed.
-- **Max concurrency** — all tasks across all benchmarks run in parallel. No queuing, no waiting.
-- **Elastic and pay-as-you-go** — Fargate pods spin up on demand and bill per-second. No idle compute.
-- **One-command teardown** — `python -m harbor_aws destroy` removes everything. Nothing left behind.
+| | |
+|---|---|
+| **One-command setup** | `python -m harbor_aws deploy` provisions VPC, EKS, IAM, and logging. No Kubernetes or AWS expertise needed. |
+| **Max concurrency** | All tasks across all benchmarks run in parallel. No queuing, no waiting. |
+| **Pay-as-you-go** | Fargate pods bill per-second. No idle compute. |
+| **One-command teardown** | `python -m harbor_aws destroy` removes everything. Nothing left behind. |
 
 ## Quick Start
 
-### 1. Install
-
 ```bash
+# 1. Install
 uv sync --extra cdk
-```
 
-### 2. Deploy Infrastructure
-
-```bash
+# 2. Deploy infrastructure (one-time, ~15 min)
 uv run python -m harbor_aws deploy
-```
 
-### 3. Run Terminal-Bench
+# 3. Run a benchmark
+uv run harbor run \
+  -d terminal-bench@2.0 \
+  -a swe-agent \
+  -m bedrock/anthropic.claude-sonnet-4-20250514-v1:0 \
+  -n 89 \
+  --environment-import-path harbor_aws.environment:AWSEnvironment
 
-```bash
-uv run harbor run -d terminal-bench@2.0 -a swe-agent -m bedrock/zai.glm-4.7 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment
-```
-
-Other agent/model combinations:
-
-```bash
-# Sonnet 4 via Bedrock with swe-agent
-uv run harbor run -d terminal-bench@2.0 -a swe-agent -m bedrock/anthropic.claude-sonnet-4-20250514-v1:0 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment
-
-# Sonnet 4 via API key with aider
-export ANTHROPIC_API_KEY=sk-ant-...
-uv run harbor run -d terminal-bench@2.0 -a aider -m anthropic/claude-sonnet-4-20250514 -n 89 --environment-import-path harbor_aws.environment:AWSEnvironment
-```
-
-### 4. Clean Up
-
-```bash
+# 4. Tear down when done
 uv run python -m harbor_aws destroy
 ```
 
-Fully removes everything — running tasks, stack, task definitions. Nothing left behind.
-
-## Prerequisites
-
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- AWS CLI configured with credentials
+**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/) and AWS CLI configured with credentials.
 
 ## Cost
 
@@ -57,19 +38,19 @@ Fully removes everything — running tasks, stack, task definitions. Nothing lef
 |---|---|
 | EKS control plane | ~$73/mo (fixed) |
 | NAT gateway | ~$32/mo (fixed) |
-| Fargate pods | Pay-per-second only when running |
+| Fargate pods | Per-second, only when running |
 | VPC, IAM, CloudWatch | Negligible |
 
-## CLI Reference
+## CLI
 
 ```
-uv run python -m harbor_aws <command> [options]
+python -m harbor_aws <command> [options]
 
 Commands:
   deploy    Deploy infrastructure (idempotent)
   status    Show stack status and outputs
   stop      Stop all running pods (keeps infrastructure)
-  destroy   Full cleanup — tasks, stack, task definitions
+  destroy   Full cleanup — removes everything
 
 Options:
   --stack-name   Stack name (default: harbor-aws)
@@ -82,29 +63,24 @@ Options:
 ## Architecture
 
 ```
-┌─────────────┐     ┌────────────────┐     ┌──────────────┐
-│  Harbor CLI  │────▶│ AWSEnvironment │────▶│ EKS Fargate  │
-│             │     │   (adapter)    │     │   (pods)     │
-└─────────────┘     └────────────────┘     └──────────────┘
-                            │
-                    ┌───────┴───────┐
-                    │               │
-              WebSocket exec   Tar-over-exec
-              (commands)       (file transfer)
+Harbor CLI ──▶ AWSEnvironment ──▶ EKS Fargate pods
+                    │
+              ┌─────┴─────┐
+              │           │
+        WebSocket exec  Tar-over-exec
+         (commands)    (file transfer)
 ```
 
-Commands run via Kubernetes WebSocket exec (same as `kubectl exec`) — no daemon, no polling. File transfer uses tar-over-exec (same mechanism as `kubectl cp`).
-
-Infrastructure defined as CDK in `src/harbor_aws/cdk/stack.py`. Deployment synthesizes in-memory and deploys via CloudFormation — no CDK CLI needed.
+Infrastructure is defined as CDK in `src/harbor_aws/cdk/stack.py` and deployed via CloudFormation — no CDK CLI needed. Commands run via Kubernetes WebSocket exec; file transfer uses tar-over-exec (same as `kubectl cp`).
 
 ## Monitoring
 
-A CloudWatch dashboard (`harbor-aws-monitor`) is created with the stack:
+A CloudWatch dashboard (`harbor-aws-monitor`) is created automatically:
 
-- **EKS Fargate** — running pod count, CPU utilization, memory utilization
-- **Bedrock** — input/output tokens, invocations, errors, throttles, latency (per model)
+- **EKS Fargate** — pod count, CPU, memory
+- **Bedrock** — tokens, invocations, errors, throttles, latency per model
 
-Pod logs are sent to CloudWatch Logs at `/harbor-aws/harbor-aws` (7-day retention).
+Pod logs: CloudWatch Logs at `/harbor-aws/harbor-aws` (7-day retention).
 
 ## Development
 
@@ -117,4 +93,4 @@ uv run mypy src/
 
 ## License
 
-MIT
+[MIT](LICENSE)
