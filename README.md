@@ -9,6 +9,13 @@ AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 | **Pay-as-you-go** | Fargate pods bill per-second. No idle compute. |
 | **One-command teardown** | `python -m harbor_aws destroy` removes everything. Nothing left behind. |
 
+## How It Works
+
+1. `python -m harbor_aws deploy` creates a shared EKS cluster and networking via CloudFormation.
+2. When Harbor runs a benchmark, each task gets its own Fargate pod with a prebuilt Docker image.
+3. Harbor executes commands and transfers files to/from pods over Kubernetes WebSocket.
+4. Pods are deleted after each task. The cluster stays up for the next run.
+
 ## Quick Start
 
 ```bash
@@ -30,25 +37,11 @@ uv run harbor run \
 uv run python -m harbor_aws destroy
 ```
 
-**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/) and AWS CLI configured with credentials.
+**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/), AWS CLI configured with credentials, and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
 
 ## Cost
 
-| Component | Cost |
-|---|---|
-| EKS control plane | ~$0.10/hr (fixed) |
-| NAT gateway | ~$0.045/hr (fixed) |
-| Fargate pod (1 vCPU, 4 GB) | ~$0.07/hr per pod |
-| VPC, IAM, CloudWatch | Negligible |
-
-> **Note:** High-concurrency runs pull many Docker images simultaneously. A [Docker Hub Pro subscription](https://www.docker.com/pricing/) ($11/mo) is recommended to avoid rate limits. AWS credentials must remain valid for the duration of the run (~1 hour expiry by default).
-
-## How It Works
-
-1. `python -m harbor_aws deploy` creates a shared EKS cluster and networking via CloudFormation.
-2. When Harbor runs a benchmark, each task gets its own Fargate pod with a prebuilt Docker image.
-3. Harbor executes commands and transfers files to/from pods over Kubernetes WebSocket.
-4. Pods are deleted after each task. The cluster stays up for the next run.
+~$0.15/hr fixed (EKS + NAT) + ~$0.07/hr per running pod. Nothing else when idle.
 
 ## Development
 
