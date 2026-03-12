@@ -37,7 +37,7 @@ uv run harbor run \
 uv run python -m harbor_aws destroy
 ```
 
-**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/), an AWS account with admin access (`aws configure`), and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
+**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/), an AWS account with admin access, and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
 
 ## Cost
 
