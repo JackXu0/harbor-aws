@@ -1,44 +1,69 @@
 # harbor-aws
 
-AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Run every task in parallel — deploy in one command, pay only when running.
+Harbor-AWS is an execution backend for [Harbor](https://github.com/harbor-framework/harbor) that runs benchmark tasks as isolated ephemeral pods on EKS Fargate. It is designed for bursty, high-parallelism workloads such as SWE-bench and Terminal-bench, where per-task isolation and pay-on-demand compute matter more than low startup latency.
 
-| | |
-|---|---|
-| **One-command setup** | `python -m harbor_aws deploy` provisions VPC, EKS, IAM, and logging. No Kubernetes or AWS expertise needed. |
-| **Max concurrency** | All tasks across all benchmarks run in parallel. No queuing, no waiting. |
-| **Pay-as-you-go** | Fargate pods bill per-second. No idle compute. |
-| **One-command teardown** | `python -m harbor_aws destroy` removes everything. Nothing left behind. |
+![Architecture](https://raw.githubusercontent.com/JackXu0/harbor-aws/main/docs/architecture.png)
 
-## How It Works
+## When to use harbor-aws
 
-1. `python -m harbor_aws deploy` creates a shared EKS cluster and networking via CloudFormation.
-2. When Harbor runs a benchmark, each task gets its own Fargate pod with a prebuilt Docker image.
-3. Harbor executes commands and transfers files to/from pods over Kubernetes WebSocket.
-4. Pods are deleted after each task. The cluster stays up for the next run.
+harbor-aws is a good fit when:
+- A run consists of many mostly independent tasks
+- Each task should execute in a clean, isolated environment
+- Workloads are bursty rather than continuous
+- You want to avoid managing a long-lived worker fleet
 
-## Quick Start
+It is less suitable for:
+- Latency-sensitive interactive workloads
+- Very short tasks where startup overhead dominates
+- Workloads that need custom node-level tuning or local caching
+
+## How it works
+
+1. `python -m harbor_aws deploy` provisions shared AWS infrastructure — networking, EKS, IAM, and logging — via CloudFormation.
+2. Each Harbor benchmark task is mapped to its own ephemeral Fargate pod.
+3. Harbor transfers files and executes commands through Kubernetes exec (WebSocket).
+4. Pods are deleted when tasks complete. The shared infrastructure can be reused for later runs.
+
+## Quick start
+
+### Prerequisites
+
+- An AWS account with admin access
+- [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls
+
+### Install
 
 ```bash
-# 1. Install
 uv sync --extra cdk
+```
 
-# 2. Deploy infrastructure (one-time, ~15 min)
+### Deploy infrastructure (one-time, ~15 min)
+
+```bash
 uv run python -m harbor_aws deploy
+```
 
-# 3. Run benchmarks (using job config)
+### Run benchmarks
+
+```bash
 uv run harbor run -c job-config.yaml \
   -d terminal-bench@2.0 \
   -a terminus-2 \
   -m bedrock/converse/moonshotai.kimi-k2.5 \
   -n 89
-
-# 4. Check status / clean up / tear down
-uv run python -m harbor_aws status
-uv run python -m harbor_aws stop       # delete pods, keep infra
-uv run python -m harbor_aws destroy    # delete everything
 ```
 
-The `job-config.yaml` wires up the AWS environment so you don't need `--environment-import-path` every time:
+### Clean up
+
+```bash
+uv run python -m harbor_aws status    # check running pods
+uv run python -m harbor_aws stop      # delete pods, keep infra
+uv run python -m harbor_aws destroy   # delete everything
+```
+
+## Configuration
+
+The `job-config.yaml` wires up the AWS environment so you don't need `--environment-import-path` on every invocation:
 
 ```yaml
 environment:
@@ -48,9 +73,16 @@ environment:
     region: us-east-1
 ```
 
-**Prerequisites:** An AWS account with admin access and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
+## Tradeoffs
 
-## Validation Results
+This design favors isolation and operational simplicity, but it has real costs:
+
+- **Startup latency.** Pod scheduling on Fargate adds non-trivial latency before a task begins.
+- **Control-plane dependence.** Lifecycle management, exec sessions, and file transfer all go through Kubernetes API paths. The control plane can become a bottleneck before raw compute capacity is exhausted.
+- **Overhead for small tasks.** One-pod-per-task execution is inefficient when tasks are very short-lived, since startup and teardown may dominate useful work.
+- **Less low-level control.** Fargate reduces infrastructure management burden, but gives less room for custom scheduling or runtime tuning than self-managed nodes.
+
+## Validation
 
 To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with the [terminus-2](https://github.com/harbor-framework/terminus-2) agent.
 
@@ -66,7 +98,7 @@ To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical r
 
 ## Cost
 
-~$0.15/hr fixed (EKS + NAT) + ~$0.07/hr per running pod. Nothing else when idle.
+Approximate baseline cost is ~$0.15/hr for shared infrastructure (EKS control plane and NAT gateway), plus ~$0.07/hr per running Fargate pod. Compute cost scales with active tasks.
 
 ## Development
 
