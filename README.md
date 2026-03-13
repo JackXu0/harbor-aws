@@ -60,7 +60,7 @@ To validate harbor-aws, we reproduced benchmarks from the [Kimi K2.5 technical r
 | Terminal-Bench 2.0 | 50.8% | 43.8% |
 | GPQA-Diamond | 87.6% | 79.8% |
 | LiveCodeBench v6 | 85.0% | 88.6% |
-| SWE-bench Pro | 50.7% | _in progress_ |
+| SWE-bench Pro | 50.7% | 29.9% |
 
 > Score gaps are expected — official Kimi K2.5 results used their internal agent for some benchmarks (SWE-bench Verified, SWE-bench Pro), while we use terminus-2 throughout.
 

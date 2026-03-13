@@ -7,7 +7,7 @@ import logging
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import boto3
 
@@ -28,6 +28,9 @@ class AWSConfig:
     # EKS
     eks_cluster_name: str = "harbor-aws"
     namespace: str = "harbor"
+
+    # AWS account (needed for ECR pull-through cache URI)
+    account_id: str | None = None
 
     # Stack-based configuration (alternative to individual fields)
     stack_name: str | None = None
@@ -71,7 +74,8 @@ class _K8sClientCache:
             return self._api
 
     def _refresh(self) -> None:
-        from kubernetes import client, config as k8s_config
+        from kubernetes import client
+        from kubernetes import config as k8s_config
 
         try:
             k8s_config.load_kube_config()
@@ -132,7 +136,7 @@ async def load_config_from_stack(
 ) -> AWSConfig:
     """Load AWSConfig from CloudFormation stack outputs."""
 
-    def _read_outputs() -> dict[str, str]:
+    def _read_outputs() -> tuple[dict[str, str], str]:
         session = boto3.Session(profile_name=profile_name, region_name=region)
         cfn = session.client("cloudformation")
         response = cfn.describe_stacks(StackName=stack_name)
@@ -148,9 +152,11 @@ async def load_config_from_stack(
         if stack["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"):
             raise RuntimeError(f"Stack '{stack_name}' is in status {stack['StackStatus']}")
 
-        return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        account_id = session.client("sts").get_caller_identity()["Account"]
+        return outputs, account_id
 
-    outputs = await asyncio.to_thread(_read_outputs)
+    outputs, account_id = await asyncio.to_thread(_read_outputs)
     logger.debug("Loaded %d outputs from stack '%s'", len(outputs), stack_name)
 
     config = AWSConfig(
@@ -159,6 +165,7 @@ async def load_config_from_stack(
         stack_name=stack_name,
         eks_cluster_name=outputs.get("EksClusterName", "harbor-aws"),
         namespace=outputs.get("Namespace", "harbor"),
+        account_id=account_id,
     )
 
     config.validate()

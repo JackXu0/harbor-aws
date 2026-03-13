@@ -8,6 +8,7 @@ from constructs import Construct
 import aws_cdk as cdk
 from aws_cdk import (
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_eks as eks,
     aws_iam as iam,
     aws_logs as logs,
@@ -165,6 +166,35 @@ class HarborAWSStack(cdk.Stack):
             log_group_name=f"/harbor-aws/{stack_prefix}",
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        # ============================================================
+        # ECR Pull-Through Cache for Docker Hub
+        # Pods pull from ECR instead of Docker Hub — no rate limits,
+        # same-region speed, no NAT data transfer costs (with VPC endpoint).
+        # First pull of an image is a cache miss (fetches from Docker Hub),
+        # subsequent pulls hit ECR directly. ECR checks for updates every 24h.
+        # ============================================================
+
+        ecr.CfnPullThroughCacheRule(
+            self,
+            "DockerHubCache",
+            ecr_repository_prefix="docker-hub",
+            upstream_registry_url="registry-1.docker.io",
+        )
+
+        # VPC endpoint for ECR — pods pull images without going through NAT
+        vpc.add_interface_endpoint(
+            "EcrApiEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.ECR,
+        )
+        vpc.add_interface_endpoint(
+            "EcrDkrEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+        )
+        vpc.add_gateway_endpoint(
+            "S3Endpoint",
+            service=ec2.GatewayVpcEndpointAwsService.S3,
         )
 
         # ============================================================

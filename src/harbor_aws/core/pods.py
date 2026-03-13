@@ -89,6 +89,64 @@ async def create_pod(
     return pod_name
 
 
+async def wait_for_image_pulled(
+    api: client.CoreV1Api,
+    config: AWSConfig,
+    pod_name: str,
+    timeout_sec: int = 600,
+) -> None:
+    """Wait until the pod is scheduled and image pull is no longer in progress.
+
+    This allows the image pull semaphore to be released earlier than waiting
+    for the pod to be fully running.  On Fargate the scheduling phase (before
+    any container_statuses appear) takes 10-30s and has nothing to do with
+    Docker Hub — releasing the semaphore after that saves significant time.
+
+    Returns when:
+    - Pod is Running/Failed/Succeeded, OR
+    - container_statuses are present with no image-pull errors
+      (meaning scheduling is done and the image is pulled or being created)
+
+    Keeps holding if ErrImagePull/ImagePullBackOff is detected, so the
+    semaphore continues to protect Docker Hub from additional pull attempts.
+    """
+    logger.debug("Waiting for image pull on pod %s...", pod_name)
+
+    for elapsed in range(0, timeout_sec, 3):
+        try:
+            pod = await asyncio.to_thread(
+                api.read_namespaced_pod_status,
+                name=pod_name,
+                namespace=config.namespace,
+            )
+        except Exception as e:
+            logger.warning("[image-pull] status check failed for %s: %s", pod_name, e)
+            await asyncio.sleep(3)
+            continue
+
+        phase = pod.status.phase
+        if phase in ("Running", "Failed", "Succeeded"):
+            return
+
+        # container_statuses appear once Fargate has scheduled the pod
+        if pod.status.container_statuses:
+            has_pull_error = False
+            for cs in pod.status.container_statuses:
+                if cs.state and cs.state.waiting:
+                    reason = cs.state.waiting.reason or ""
+                    if reason in ("ErrImagePull", "ImagePullBackOff"):
+                        has_pull_error = True
+                        break
+            if not has_pull_error:
+                logger.debug("Pod %s scheduled, image pull complete or in progress — releasing semaphore", pod_name)
+                return
+
+        await asyncio.sleep(3)
+
+    # Timeout — release semaphore anyway, let wait_for_pod_running handle errors
+    logger.debug("Pod %s image pull wait timed out after %ds — releasing semaphore", pod_name, timeout_sec)
+
+
 async def wait_for_pod_running(
     api: client.CoreV1Api,
     config: AWSConfig,

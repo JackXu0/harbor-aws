@@ -6,14 +6,14 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from pathlib import Path
-
-from kubernetes import client
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+from kubernetes import client
 
 from harbor_aws.core import exec, files, pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
@@ -108,6 +108,20 @@ class AWSEnvironment(BaseEnvironment):
         else:
             self._aws_config.validate()
 
+        # Resolve account_id for ECR pull-through cache if not already set
+        if not self._aws_config.account_id:
+            try:
+                import boto3
+                session = boto3.Session(
+                    profile_name=self._aws_config.profile_name,
+                    region_name=self._aws_config.region,
+                )
+                self._aws_config.account_id = await asyncio.to_thread(
+                    lambda: session.client("sts").get_caller_identity()["Account"]
+                )
+            except Exception as e:
+                self.logger.warning("Could not resolve AWS account ID for ECR cache: %s", e)
+
         self._config_loaded = True
 
     _shared_k8s_api = None
@@ -126,7 +140,7 @@ class AWSEnvironment(BaseEnvironment):
     # Limit concurrent image pulls to avoid Docker Hub rate limits.
     # Only this many pods will be in the create+pull phase at a time;
     # once a pod is Running the slot is released for the next one.
-    _IMAGE_PULL_CONCURRENCY = 50
+    _IMAGE_PULL_CONCURRENCY = 500
     _image_pull_semaphore: asyncio.Semaphore | None = None
 
     @classmethod
@@ -184,6 +198,34 @@ class AWSEnvironment(BaseEnvironment):
         AWSEnvironment._docker_secret_name = secret_name
         AWSEnvironment._docker_secret_checked = True
 
+    def _ecr_image_uri(self, image: str) -> str:
+        """Rewrite a Docker Hub image URI to use the ECR pull-through cache.
+
+        docker.io/library/ubuntu:22.04  →  …/docker-hub/library/ubuntu:22.04
+        swebench/sweb.eval.x86_64:latest →  …/docker-hub/swebench/sweb.eval.x86_64:latest
+
+        Images already pointing at ECR or other registries are returned unchanged.
+        """
+        # Already an ECR or other registry URI — leave unchanged
+        if re.match(r"^[\w.-]+\.amazonaws\.com/", image) or re.match(r"^[\w.-]+\.\w{2,}/", image):
+            return image
+
+        # Strip explicit docker.io prefix if present
+        stripped = re.sub(r"^(docker\.io|registry-1\.docker\.io)/", "", image)
+
+        # Docker Hub official images have no namespace — add "library/"
+        if "/" not in stripped.split(":")[0]:
+            stripped = f"library/{stripped}"
+
+        account = self._aws_config.account_id
+        region = self._aws_config.region
+
+        if not account:
+            self.logger.debug("No account_id available, skipping ECR rewrite for %s", image)
+            return image
+
+        return f"{account}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
+
     def _parse_dockerfile(self) -> tuple[str | None, list[str]]:
         """Parse Dockerfile to extract base image and RUN/WORKDIR commands.
 
@@ -227,9 +269,15 @@ class AWSEnvironment(BaseEnvironment):
                 "No docker_image specified and no Dockerfile found. "
                 "harbor-aws only supports prebuilt images."
             )
+        # Rewrite Docker Hub images to use ECR pull-through cache
+        image_uri = self._ecr_image_uri(image_uri)
         self.logger.debug("Using image: %s", image_uri)
 
-        # Limit concurrent image pulls to avoid Docker Hub rate limits
+        # Limit concurrent image pulls.  With ECR pull-through cache the
+        # limit is high (500) since there are no Docker Hub rate limits.
+        # The semaphore is released once the image is pulled (not when the
+        # pod is fully running), so Fargate scheduling time doesn't block
+        # other pods from starting their image pulls.
         async with self._get_pull_semaphore():
             self.logger.debug("[start] creating pod for %s", self.environment_name)
             self._pod_name = await pods.create_pod(
@@ -244,15 +292,22 @@ class AWSEnvironment(BaseEnvironment):
             )
             self.logger.debug("[start] pod created: %s", self._pod_name)
 
-            try:
-                await pods.wait_for_pod_running(
-                    self._k8s_api,
-                    self._aws_config,
-                    self._pod_name,
-                )
-            except Exception as e:
-                self.logger.error("[start] wait_for_pod_running FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
-                raise
+            await pods.wait_for_image_pulled(
+                self._k8s_api,
+                self._aws_config,
+                self._pod_name,
+            )
+
+        # Wait for the pod to be fully running (outside the semaphore)
+        try:
+            await pods.wait_for_pod_running(
+                self._k8s_api,
+                self._aws_config,
+                self._pod_name,
+            )
+        except Exception as e:
+            self.logger.error("[start] wait_for_pod_running FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
+            raise
         self.logger.debug("[start] pod running: %s", self._pod_name)
 
         # Run Dockerfile RUN/WORKDIR commands if image was extracted from Dockerfile
@@ -275,6 +330,22 @@ class AWSEnvironment(BaseEnvironment):
             raise
         if mkdir_result.return_code != 0:
             raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
+
+        # Install 'script' command if missing — terminus-2 requires it for tmux sessions.
+        # Some SWE-bench Pro images (Go, JS repos) don't include bsdutils.
+        check = await self.exec("command -v script")
+        if check.return_code != 0:
+            self.logger.debug("[start] installing bsdutils (script) in pod %s", self._pod_name)
+            install = await self.exec(
+                "apt-get update -qq && apt-get install -y -qq bsdutils 2>/dev/null"
+                " || apk add --no-cache util-linux 2>/dev/null"
+                " || yum install -y util-linux 2>/dev/null"
+                " || true",
+                timeout_sec=120,
+            )
+            if install.return_code != 0:
+                self.logger.warning("[start] bsdutils install may have failed (rc=%d) in %s", install.return_code, self._pod_name)
+
         self.logger.debug("[start] pod %s fully ready", self._pod_name)
 
     async def stop(self, delete: bool) -> None:
