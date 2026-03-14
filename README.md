@@ -40,7 +40,49 @@ environment:
     region: us-east-1
 ```
 
-> **Prerequisites:** AWS account with admin access and [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) for high-concurrency image pulls.
+> **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
+
+## ECR Pull-Through Cache (Optional)
+
+By default, pods pull images directly from Docker Hub with a concurrency limit of 50 simultaneous pulls. For higher throughput (500+ concurrent pods), you can enable the ECR pull-through cache, which proxies Docker Hub images through your account's ECR registry — eliminating rate limits and providing faster same-region pulls.
+
+To enable, add `ecr_cache: true` to your job config:
+
+```yaml
+environment:
+  import_path: "harbor_aws.adapter:AWSEnvironment"
+  kwargs:
+    stack_name: harbor-aws
+    region: us-east-1
+    ecr_cache: true
+```
+
+**One-time setup required:**
+
+1. Get a [Docker Hub Pro](https://www.docker.com/pricing/) access token ($11/mo) and store it in Secrets Manager:
+
+   ```bash
+   aws secretsmanager create-secret \
+     --name ecr-pullthroughcache/docker-hub \
+     --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
+     --region us-east-1
+   ```
+
+2. Create the ECR pull-through cache rule:
+
+   ```bash
+   aws ecr create-pull-through-cache-rule \
+     --ecr-repository-prefix docker-hub \
+     --upstream-registry-url registry-1.docker.io \
+     --credential-arn arn:aws:secretsmanager:us-east-1:YOUR_ACCOUNT_ID:secret:ecr-pullthroughcache/docker-hub-XXXXXX \
+     --region us-east-1
+   ```
+
+| | Docker Hub (default) | ECR Cache |
+|---|---|---|
+| Concurrent pulls | 50 | 500 |
+| Setup | `docker login` | Steps above + Docker Hub Pro ($11/mo) |
+| Pull speed | Over internet | In-region |
 
 ## Validation
 

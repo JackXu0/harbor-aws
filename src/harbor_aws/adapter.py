@@ -43,6 +43,7 @@ class AWSEnvironment(BaseEnvironment):
         stack_name: str = "harbor-aws",
         eks_cluster_name: str = "harbor-aws",
         namespace: str = "harbor",
+        ecr_cache: bool = False,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -62,6 +63,7 @@ class AWSEnvironment(BaseEnvironment):
             stack_name=stack_name,
             eks_cluster_name=eks_cluster_name,
             namespace=namespace,
+            ecr_cache=ecr_cache,
         )
 
         self._k8s_api: client.CoreV1Api | None = None
@@ -99,17 +101,19 @@ class AWSEnvironment(BaseEnvironment):
                 self._aws_config = AWSEnvironment._cached_stack_config
             else:
                 self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
+                ecr_cache = self._aws_config.ecr_cache
                 self._aws_config = await load_config_from_stack(
                     stack_name=self._aws_config.stack_name,
                     region=self._aws_config.region,
                     profile_name=self._aws_config.profile_name,
                 )
+                self._aws_config.ecr_cache = ecr_cache
                 AWSEnvironment._cached_stack_config = self._aws_config
         else:
             self._aws_config.validate()
 
-        # Resolve account_id for ECR pull-through cache if not already set
-        if not self._aws_config.account_id:
+        # Resolve account_id for ECR pull-through cache if enabled
+        if self._aws_config.ecr_cache and not self._aws_config.account_id:
             try:
                 import boto3
                 session = boto3.Session(
@@ -140,13 +144,16 @@ class AWSEnvironment(BaseEnvironment):
     # Limit concurrent image pulls to avoid Docker Hub rate limits.
     # Only this many pods will be in the create+pull phase at a time;
     # once a pod is Running the slot is released for the next one.
-    _IMAGE_PULL_CONCURRENCY = 500
+    # With ECR cache there are no Docker Hub rate limits, so the limit is high.
     _image_pull_semaphore: asyncio.Semaphore | None = None
+    _image_pull_semaphore_size: int = 0
 
     @classmethod
-    def _get_pull_semaphore(cls) -> asyncio.Semaphore:
-        if cls._image_pull_semaphore is None:
-            cls._image_pull_semaphore = asyncio.Semaphore(cls._IMAGE_PULL_CONCURRENCY)
+    def _get_pull_semaphore(cls, ecr_cache: bool = False) -> asyncio.Semaphore:
+        limit = 500 if ecr_cache else 50
+        if cls._image_pull_semaphore is None or cls._image_pull_semaphore_size != limit:
+            cls._image_pull_semaphore = asyncio.Semaphore(limit)
+            cls._image_pull_semaphore_size = limit
         return cls._image_pull_semaphore
 
     async def _ensure_docker_pull_secret(self) -> None:
@@ -269,16 +276,15 @@ class AWSEnvironment(BaseEnvironment):
                 "No docker_image specified and no Dockerfile found. "
                 "harbor-aws only supports prebuilt images."
             )
-        # Rewrite Docker Hub images to use ECR pull-through cache
-        image_uri = self._ecr_image_uri(image_uri)
+        # Rewrite Docker Hub images to use ECR pull-through cache (opt-in)
+        if self._aws_config.ecr_cache:
+            image_uri = self._ecr_image_uri(image_uri)
         self.logger.debug("Using image: %s", image_uri)
 
-        # Limit concurrent image pulls.  With ECR pull-through cache the
-        # limit is high (500) since there are no Docker Hub rate limits.
-        # The semaphore is released once the image is pulled (not when the
-        # pod is fully running), so Fargate scheduling time doesn't block
-        # other pods from starting their image pulls.
-        async with self._get_pull_semaphore():
+        # Limit concurrent image pulls.  With ECR cache: 500 (no rate limits).
+        # Without: 50 (Docker Hub rate limits).  The semaphore is released once
+        # the image is pulled, so Fargate scheduling doesn't block other pods.
+        async with self._get_pull_semaphore(self._aws_config.ecr_cache):
             self.logger.debug("[start] creating pod for %s", self.environment_name)
             self._pod_name = await pods.create_pod(
                 self._k8s_api,

@@ -32,6 +32,9 @@ class AWSConfig:
     # AWS account (needed for ECR pull-through cache URI)
     account_id: str | None = None
 
+    # ECR pull-through cache (opt-in, requires setup — see README)
+    ecr_cache: bool = False
+
     # Stack-based configuration (alternative to individual fields)
     stack_name: str | None = None
 
