@@ -62,12 +62,33 @@ Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/ab
 
 ## Scaling
 
-Out of the box, harbor-aws supports up to 50 concurrent pods (limited by Docker Hub pull rate limits). For higher concurrency, enable the ECR pull-through cache.
+Supports up to **50 concurrent pods** out of the box. To scale beyond that, enable ECR pull-through cache to bypass Docker Hub rate limits.
 
 <details>
-<summary><b>ECR Pull-Through Cache</b> — enable 500+ concurrent pods by proxying Docker Hub through ECR (eliminates rate limits, faster in-region pulls)</summary>
+<summary>ECR pull-through cache setup (500+ concurrent pods)</summary>
 
-Add `ecr_cache: true` to your job config:
+Proxies Docker Hub images through your account's ECR — no rate limits, faster in-region pulls. Requires [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo).
+
+**1. Store Docker Hub credentials in Secrets Manager:**
+
+```bash
+aws secretsmanager create-secret \
+  --name ecr-pullthroughcache/docker-hub \
+  --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
+  --region us-east-1
+```
+
+**2. Create the cache rule:**
+
+```bash
+aws ecr create-pull-through-cache-rule \
+  --ecr-repository-prefix docker-hub \
+  --upstream-registry-url registry-1.docker.io \
+  --credential-arn arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:ecr-pullthroughcache/docker-hub-XXXXXX \
+  --region us-east-1
+```
+
+**3. Enable in job config:**
 
 ```yaml
 environment:
@@ -77,33 +98,6 @@ environment:
     region: us-east-1
     ecr_cache: true
 ```
-
-**One-time setup required:**
-
-1. Get a [Docker Hub Pro](https://www.docker.com/pricing/) access token ($11/mo) and store it in Secrets Manager:
-
-   ```bash
-   aws secretsmanager create-secret \
-     --name ecr-pullthroughcache/docker-hub \
-     --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
-     --region us-east-1
-   ```
-
-2. Create the ECR pull-through cache rule:
-
-   ```bash
-   aws ecr create-pull-through-cache-rule \
-     --ecr-repository-prefix docker-hub \
-     --upstream-registry-url registry-1.docker.io \
-     --credential-arn arn:aws:secretsmanager:us-east-1:YOUR_ACCOUNT_ID:secret:ecr-pullthroughcache/docker-hub-XXXXXX \
-     --region us-east-1
-   ```
-
-| | Docker Hub (default) | ECR Cache |
-|---|---|---|
-| Concurrent pulls | 50 | 500 |
-| Setup | `docker login` | Steps above + Docker Hub Pro ($11/mo) |
-| Pull speed | Over internet | In-region |
 
 </details>
 
