@@ -206,12 +206,12 @@ class AWSEnvironment(BaseEnvironment):
 
         Images already pointing at ECR or other registries are returned unchanged.
         """
-        # Already an ECR or other registry URI — leave unchanged
-        if re.match(r"^[\w.-]+\.amazonaws\.com/", image) or re.match(r"^[\w.-]+\.\w{2,}/", image):
-            return image
-
         # Strip explicit docker.io prefix if present
         stripped = re.sub(r"^(docker\.io|registry-1\.docker\.io)/", "", image)
+
+        # Already an ECR or other registry URI — leave unchanged
+        if re.match(r"^[\w.-]+\.amazonaws\.com/", stripped) or re.match(r"^[\w.-]+\.\w{2,}/", stripped):
+            return image
 
         # Docker Hub official images have no namespace — add "library/"
         if "/" not in stripped.split(":")[0]:

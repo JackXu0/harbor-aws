@@ -89,6 +89,19 @@ class HarborAWSStack(cdk.Stack):
             ),
         )
 
+        # Grant ECR pull-through cache permissions to Fargate pod execution roles.
+        # Without these, first-pull cache misses fail because the role can't
+        # create ECR repos or import upstream images on behalf of the pod.
+        for child in cluster.node.children:
+            if hasattr(child, "pod_execution_role"):
+                child.pod_execution_role.add_to_principal_policy(
+                    iam.PolicyStatement(
+                        sid="ECRPullThroughCache",
+                        actions=["ecr:CreateRepository", "ecr:BatchImportUpstreamImage"],
+                        resources=[f"arn:aws:ecr:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:repository/docker-hub/*"],
+                    )
+                )
+
         # Patch CoreDNS to run on Fargate (remove ec2 compute-type annotation)
         coredns_patch = cluster.add_manifest(
             "CoreDnsFargatePatch",

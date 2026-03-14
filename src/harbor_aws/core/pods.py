@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import traceback
 
 from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
 from harbor_aws.core.config import AWSConfig
+from harbor_aws.core.watcher import PodWatcher
 
 logger = logging.getLogger(__name__)
 
@@ -97,54 +97,22 @@ async def wait_for_image_pulled(
 ) -> None:
     """Wait until the pod is scheduled and image pull is no longer in progress.
 
-    This allows the image pull semaphore to be released earlier than waiting
-    for the pod to be fully running.  On Fargate the scheduling phase (before
-    any container_statuses appear) takes 10-30s and has nothing to do with
-    Docker Hub — releasing the semaphore after that saves significant time.
-
-    Returns when:
-    - Pod is Running/Failed/Succeeded, OR
-    - container_statuses are present with no image-pull errors
-      (meaning scheduling is done and the image is pulled or being created)
-
-    Keeps holding if ErrImagePull/ImagePullBackOff is detected, so the
-    semaphore continues to protect Docker Hub from additional pull attempts.
+    Uses a shared K8s watch stream (O(1) API calls) instead of per-pod polling.
     """
     logger.debug("Waiting for image pull on pod %s...", pod_name)
+    watcher = await PodWatcher.get_or_create(config.namespace)
+    handle = watcher.register(pod_name)
 
-    for elapsed in range(0, timeout_sec, 3):
-        try:
-            pod = await asyncio.to_thread(
-                api.read_namespaced_pod_status,
-                name=pod_name,
-                namespace=config.namespace,
-            )
-        except Exception as e:
-            logger.warning("[image-pull] status check failed for %s: %s", pod_name, e)
-            await asyncio.sleep(3)
-            continue
+    try:
+        await asyncio.wait_for(handle.image_pulled.wait(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        logger.debug("Pod %s image pull wait timed out after %ds — releasing semaphore", pod_name, timeout_sec)
+        return  # release semaphore, let wait_for_pod_running handle errors
 
-        phase = pod.status.phase
-        if phase in ("Running", "Failed", "Succeeded"):
-            return
+    if handle.error:
+        raise handle.error
 
-        # container_statuses appear once Fargate has scheduled the pod
-        if pod.status.container_statuses:
-            has_pull_error = False
-            for cs in pod.status.container_statuses:
-                if cs.state and cs.state.waiting:
-                    reason = cs.state.waiting.reason or ""
-                    if reason in ("ErrImagePull", "ImagePullBackOff"):
-                        has_pull_error = True
-                        break
-            if not has_pull_error:
-                logger.debug("Pod %s scheduled, image pull complete or in progress — releasing semaphore", pod_name)
-                return
-
-        await asyncio.sleep(3)
-
-    # Timeout — release semaphore anyway, let wait_for_pod_running handle errors
-    logger.debug("Pod %s image pull wait timed out after %ds — releasing semaphore", pod_name, timeout_sec)
+    logger.debug("Pod %s image pull complete", pod_name)
 
 
 async def wait_for_pod_running(
@@ -153,60 +121,23 @@ async def wait_for_pod_running(
     pod_name: str,
     timeout_sec: int = 1800,
 ) -> None:
-    """Wait for pod to reach Running phase and be ready for exec."""
+    """Wait for pod to reach Running phase and be ready for exec.
+
+    Uses a shared K8s watch stream (O(1) API calls) instead of per-pod polling.
+    """
     logger.debug("Waiting for pod %s to be running...", pod_name)
+    watcher = await PodWatcher.get_or_create(config.namespace)
+    handle = watcher.register(pod_name)
 
-    for elapsed in range(0, timeout_sec, 5):
-        try:
-            pod = await asyncio.to_thread(
-                api.read_namespaced_pod_status,
-                name=pod_name,
-                namespace=config.namespace,
-            )
-        except Exception as e:
-            logger.error(
-                "[wait] read_namespaced_pod_status FAILED for %s at %ds: %s: %s\n%s",
-                pod_name, elapsed, type(e).__name__, str(e)[:300], traceback.format_exc(),
-            )
-            raise
+    try:
+        await asyncio.wait_for(handle.pod_running.wait(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"Pod {pod_name} not running after {timeout_sec}s") from None
 
-        phase = pod.status.phase
+    if handle.error:
+        raise handle.error
 
-        if phase == "Running":
-            # Verify all containers are ready before returning
-            all_ready = True
-            for cs in pod.status.container_statuses or []:
-                if not cs.ready:
-                    all_ready = False
-                    break
-            if all_ready:
-                logger.debug("Pod %s is running and ready", pod_name)
-                return
-            if elapsed % 15 == 0:
-                logger.debug("Pod %s is Running but containers not ready yet (%ds)", pod_name, elapsed)
-
-        elif phase in ("Failed", "Succeeded"):
-            reason = _get_pod_failure_reason(pod)
-            raise RuntimeError(f"Pod {pod_name} terminated before becoming ready: {reason}")
-
-        else:
-            # Detect unrecoverable image pull errors (e.g. no space left on device)
-            for cs in pod.status.container_statuses or []:
-                if cs.state and cs.state.waiting:
-                    wait_msg = cs.state.waiting.message or ""
-                    if "no space left on device" in wait_msg:
-                        raise RuntimeError(f"Pod {pod_name} image pull failed: {wait_msg}")
-
-            if elapsed % 60 == 0:
-                wait_reason = ""
-                for cs in pod.status.container_statuses or []:
-                    if cs.state and cs.state.waiting:
-                        wait_reason = f" ({cs.state.waiting.reason})"
-                logger.debug("Pod %s status: %s%s (%ds elapsed)", pod_name, phase, wait_reason, elapsed)
-
-        await asyncio.sleep(5)
-
-    raise RuntimeError(f"Pod {pod_name} not running after {timeout_sec}s")
+    logger.debug("Pod %s is running and ready", pod_name)
 
 
 @retry(
@@ -232,6 +163,10 @@ async def delete_pod(
         if e.status != 404:
             raise
 
+    # Clean up watcher state
+    if PodWatcher._instance is not None:
+        PodWatcher._instance.unregister(pod_name)
+
 
 async def list_pods(
     api: client.CoreV1Api,
@@ -251,14 +186,3 @@ def _make_pod_name(session_id: str) -> str:
     name = re.sub(r"[^a-z0-9-]", "-", session_id.lower())[:58]
     name = name.strip("-")
     return f"hb-{name}"
-
-
-def _get_pod_failure_reason(pod: client.V1Pod) -> str:
-    """Extract failure reason from pod status."""
-    reasons = []
-    for cs in pod.status.container_statuses or []:
-        if cs.state and cs.state.terminated:
-            reasons.append(f"{cs.name}: {cs.state.terminated.reason or 'unknown'}")
-        elif cs.state and cs.state.waiting:
-            reasons.append(f"{cs.name}: {cs.state.waiting.reason or 'unknown'}")
-    return "; ".join(reasons) if reasons else pod.status.phase or "unknown"

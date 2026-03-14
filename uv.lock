@@ -221,6 +221,22 @@ wheels = [
 ]
 
 [[package]]
+name = "aws-cdk-lambda-layer-kubectl-v31"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aws-cdk-lib" },
+    { name = "constructs" },
+    { name = "jsii" },
+    { name = "publication" },
+    { name = "typeguard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fb/fb/42741eec8c9f483b994ae5560c00f89973ae5d3b08d9d69a1fc0cbeb24d5/aws_cdk_lambda_layer_kubectl_v31-2.1.0.tar.gz", hash = "sha256:009a95911f30a2e1f7d78972f4f69c56e4f1ef50316c3d68b5ae13053a37ad6c", size = 34341998, upload-time = "2025-05-16T19:03:45.856Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/a1/b14431ebb9174b6ed138ed311dbab740416f1f39ea31832ef70791e4de82/aws_cdk_lambda_layer_kubectl_v31-2.1.0-py3-none-any.whl", hash = "sha256:ad6e9bb63360f709043547c129d81efe3da53dc12cafdbaf4a7a605cb1f0f117", size = 34340958, upload-time = "2025-05-16T19:03:43.06Z" },
+]
+
+[[package]]
 name = "aws-cdk-lib"
 version = "2.241.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1125,6 +1141,7 @@ dependencies = [
 
 [package.optional-dependencies]
 cdk = [
+    { name = "aws-cdk-lambda-layer-kubectl-v31" },
     { name = "aws-cdk-lib" },
     { name = "constructs" },
 ]
@@ -1139,6 +1156,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aws-cdk-lambda-layer-kubectl-v31", marker = "extra == 'cdk'", specifier = ">=2.0.0" },
     { name = "aws-cdk-lib", marker = "extra == 'cdk'", specifier = ">=2.150.0" },
     { name = "boto3", specifier = ">=1.35.0" },
     { name = "constructs", marker = "extra == 'cdk'", specifier = ">=10.0.0" },
