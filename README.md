@@ -42,11 +42,32 @@ environment:
 
 > **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
 
-## ECR Pull-Through Cache (Optional)
+## Validation
 
-By default, pods pull images directly from Docker Hub with a concurrency limit of 50 simultaneous pulls. For higher throughput (500+ concurrent pods), you can enable the ECR pull-through cache, which proxies Docker Hub images through your account's ECR registry — eliminating rate limits and providing faster same-region pulls.
+Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with [terminus-2](https://github.com/harbor-framework/terminus-2).
 
-To enable, add `ecr_cache: true` to your job config:
+| Benchmark | Official | harbor-aws |
+|---|:---:|:---:|
+| SWE-bench Verified | 76.8% | 71.5% |
+| Terminal-Bench 2.0 | 50.8% | 43.8% |
+| GPQA-Diamond | 87.6% | 79.8% |
+| LiveCodeBench v6 | 85.0% | 88.6% |
+| SWE-bench Pro | 50.7% | 29.9% |
+
+> Score gaps are expected — official results used Kimi's internal agent for some benchmarks, while we use terminus-2 throughout.
+
+## Documentation
+
+- [System Architecture & Design Principles](https://hammerhead-floor-229.notion.site/Harbor-AWS-System-Architecture-Design-Principles-322c2bfbdd1781b997dad4c5e54b2ee7) — architecture overview, tradeoffs, and design rationale
+
+## Scaling
+
+Out of the box, harbor-aws supports up to 50 concurrent pods (limited by Docker Hub pull rate limits). For higher concurrency, enable the ECR pull-through cache.
+
+<details>
+<summary><b>ECR Pull-Through Cache</b> — enable 500+ concurrent pods by proxying Docker Hub through ECR (eliminates rate limits, faster in-region pulls)</summary>
+
+Add `ecr_cache: true` to your job config:
 
 ```yaml
 environment:
@@ -84,23 +105,7 @@ environment:
 | Setup | `docker login` | Steps above + Docker Hub Pro ($11/mo) |
 | Pull speed | Over internet | In-region |
 
-## Validation
-
-Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with [terminus-2](https://github.com/harbor-framework/terminus-2).
-
-| Benchmark | Official | harbor-aws |
-|---|:---:|:---:|
-| SWE-bench Verified | 76.8% | 71.5% |
-| Terminal-Bench 2.0 | 50.8% | 43.8% |
-| GPQA-Diamond | 87.6% | 79.8% |
-| LiveCodeBench v6 | 85.0% | 88.6% |
-| SWE-bench Pro | 50.7% | 29.9% |
-
-> Score gaps are expected — official results used Kimi's internal agent for some benchmarks, while we use terminus-2 throughout.
-
-## Documentation
-
-- [System Architecture & Design Principles](https://hammerhead-floor-229.notion.site/Harbor-AWS-System-Architecture-Design-Principles-322c2bfbdd1781b997dad4c5e54b2ee7) — architecture overview, tradeoffs, and design rationale
+</details>
 
 ## Development
 
