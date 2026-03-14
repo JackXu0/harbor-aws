@@ -42,6 +42,39 @@ environment:
 
 > **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
 
+## Scaling
+
+Supports **50 concurrent pods** by default (Docker Hub rate limit). Enable ECR pull-through cache for **500+**.
+
+<details>
+<summary>ECR pull-through cache setup</summary>
+
+Caches Docker Hub images in your account's ECR. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended (5,000 pulls/6h vs 200 on free).
+
+**1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
+
+```bash
+aws secretsmanager create-secret \
+  --name ecr-pullthroughcache/docker-hub \
+  --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
+  --region us-east-1
+```
+
+The CDK stack automatically creates the ECR cache rule using this secret.
+
+**2. Enable in job config:**
+
+```yaml
+environment:
+  import_path: "harbor_aws.adapter:AWSEnvironment"
+  kwargs:
+    stack_name: harbor-aws
+    region: us-east-1
+    ecr_cache: true
+```
+
+</details>
+
 ## Validation
 
 Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with [terminus-2](https://github.com/harbor-framework/terminus-2).
@@ -62,12 +95,12 @@ Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/ab
 
 ## Scaling
 
-Supports up to **50 concurrent pods** out of the box. To scale beyond that, enable ECR pull-through cache to bypass Docker Hub rate limits.
+Supports **50 concurrent pods** by default (Docker Hub rate limit). Enable ECR pull-through cache for **500+**.
 
 <details>
-<summary>ECR pull-through cache setup (500+ concurrent pods)</summary>
+<summary>ECR pull-through cache setup</summary>
 
-Proxies Docker Hub images through your account's ECR — faster in-region pulls. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended for the higher pull rate limit (5,000/6h vs 200/6h on free).
+Caches Docker Hub images in your account's ECR. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended (5,000 pulls/6h vs 200 on free).
 
 **1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
 
