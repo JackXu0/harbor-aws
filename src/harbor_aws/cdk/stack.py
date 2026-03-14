@@ -189,11 +189,17 @@ class HarborAWSStack(cdk.Stack):
         # subsequent pulls hit ECR directly. ECR checks for updates every 24h.
         # ============================================================
 
+        # The credential secret must be created manually before deploying
+        # (it contains the user's Docker Hub credentials — see README).
+        docker_hub_secret_name = "ecr-pullthroughcache/docker-hub"
+        docker_hub_secret = f"arn:aws:secretsmanager:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:secret:{docker_hub_secret_name}"
+
         ecr.CfnPullThroughCacheRule(
             self,
             "DockerHubCache",
             ecr_repository_prefix="docker-hub",
             upstream_registry_url="registry-1.docker.io",
+            credential_arn=docker_hub_secret,
         )
 
         # VPC endpoint for ECR — pods pull images without going through NAT

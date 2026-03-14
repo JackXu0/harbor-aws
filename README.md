@@ -67,9 +67,9 @@ Supports up to **50 concurrent pods** out of the box. To scale beyond that, enab
 <details>
 <summary>ECR pull-through cache setup (500+ concurrent pods)</summary>
 
-Proxies Docker Hub images through your account's ECR — no rate limits, faster in-region pulls. Requires [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo).
+Proxies Docker Hub images through your account's ECR — faster in-region pulls. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended for the higher pull rate limit (5,000/6h vs 200/6h on free).
 
-**1. Store Docker Hub credentials in Secrets Manager:**
+**1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
 
 ```bash
 aws secretsmanager create-secret \
@@ -78,17 +78,9 @@ aws secretsmanager create-secret \
   --region us-east-1
 ```
 
-**2. Create the cache rule:**
+The CDK stack automatically creates the ECR cache rule using this secret.
 
-```bash
-aws ecr create-pull-through-cache-rule \
-  --ecr-repository-prefix docker-hub \
-  --upstream-registry-url registry-1.docker.io \
-  --credential-arn arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:ecr-pullthroughcache/docker-hub-XXXXXX \
-  --region us-east-1
-```
-
-**3. Enable in job config:**
+**2. Enable in job config:**
 
 ```yaml
 environment:
