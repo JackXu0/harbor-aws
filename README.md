@@ -47,9 +47,13 @@ environment:
 Image pulls are capped at 50 concurrent operations by default to avoid Docker Hub rate limiting. For higher sustained concurrency, configure Amazon ECR pull-through cache for Docker Hub images.
 
 <details>
-<summary>ECR pull-through cache setup</summary>
+<summary><strong>ECR pull-through cache setup</strong></summary>
 
-**1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
+To use ECR pull-through cache for Docker Hub images:
+
+#### 1. Create the Docker Hub secret in AWS Secrets Manager
+
+This must be done before running `deploy`:
 
 ```bash
 aws secretsmanager create-secret \
