@@ -30,16 +30,6 @@ uv run python -m harbor_aws stop      # delete pods, keep infra
 uv run python -m harbor_aws destroy   # delete everything
 ```
 
-The `job-config.yaml` wires up the AWS environment:
-
-```yaml
-environment:
-  import_path: "harbor_aws.adapter:AWSEnvironment"
-  kwargs:
-    stack_name: harbor-aws
-    region: us-east-1
-```
-
 > **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
 
 ## Scaling
