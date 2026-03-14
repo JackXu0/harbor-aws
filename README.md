@@ -44,12 +44,10 @@ environment:
 
 ## Scaling
 
-Image pulls are throttled to **50 at a time** by default to stay within Docker Hub rate limits. Enable ECR pull-through cache to remove this bottleneck.
+Image pulls are capped at 50 concurrent operations by default to avoid Docker Hub rate limiting. For higher sustained concurrency, configure Amazon ECR pull-through cache for Docker Hub images.
 
 <details>
 <summary>ECR pull-through cache setup</summary>
-
-Caches Docker Hub images in your account's ECR. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended (5,000 pulls/6h vs 200 on free).
 
 **1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
 
