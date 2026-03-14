@@ -44,7 +44,7 @@ environment:
 
 ## Scaling
 
-Supports **50 concurrent pods** by default (Docker Hub rate limit). Enable ECR pull-through cache for **500+**.
+Image pulls are throttled to **50 at a time** by default to stay within Docker Hub rate limits. Enable ECR pull-through cache to remove this bottleneck.
 
 <details>
 <summary>ECR pull-through cache setup</summary>
@@ -92,39 +92,6 @@ Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/ab
 ## Documentation
 
 - [System Architecture & Design Principles](https://hammerhead-floor-229.notion.site/Harbor-AWS-System-Architecture-Design-Principles-322c2bfbdd1781b997dad4c5e54b2ee7) — architecture overview, tradeoffs, and design rationale
-
-## Scaling
-
-Supports **50 concurrent pods** by default (Docker Hub rate limit). Enable ECR pull-through cache for **500+**.
-
-<details>
-<summary>ECR pull-through cache setup</summary>
-
-Caches Docker Hub images in your account's ECR. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended (5,000 pulls/6h vs 200 on free).
-
-**1. Store Docker Hub credentials in Secrets Manager (before `deploy`):**
-
-```bash
-aws secretsmanager create-secret \
-  --name ecr-pullthroughcache/docker-hub \
-  --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
-  --region us-east-1
-```
-
-The CDK stack automatically creates the ECR cache rule using this secret.
-
-**2. Enable in job config:**
-
-```yaml
-environment:
-  import_path: "harbor_aws.adapter:AWSEnvironment"
-  kwargs:
-    stack_name: harbor-aws
-    region: us-east-1
-    ecr_cache: true
-```
-
-</details>
 
 ## Development
 
