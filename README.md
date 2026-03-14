@@ -51,8 +51,6 @@ Image pulls are capped at 50 concurrent operations by default to avoid Docker Hu
 
 <br>
 
-Caches Docker Hub images in your account's ECR. [Docker Hub Pro](https://www.docker.com/pricing/) ($11/mo) recommended (5,000 pulls/6h vs 200 on free).
-
 **1. Create the Docker Hub secret in Secrets Manager (before `deploy`):**
 
 ```bash
