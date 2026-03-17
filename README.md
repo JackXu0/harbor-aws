@@ -75,7 +75,6 @@ Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/ab
 | Terminal-Bench 2.0 | 50.8% | 43.8% |
 | GPQA-Diamond | 87.6% | 79.8% |
 | LiveCodeBench v6 | 85.0% | 88.6% |
-| SWE-bench Pro | 50.7% | 29.9% |
 
 > Score gaps are expected — official results used Kimi's internal agent for some benchmarks, while we use terminus-2 throughout.
 
