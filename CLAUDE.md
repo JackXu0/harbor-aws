@@ -22,7 +22,7 @@ AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 src/harbor_aws/
 ├── __init__.py              # Exports: AWSConfig, AWSEnvironment
 ├── __main__.py              # CLI: python -m harbor_aws deploy|status|stop|destroy
-├── environment.py           # Harbor BaseEnvironment adapter
+├── adapter.py               # Harbor BaseEnvironment adapter
 ├── cdk/
 │   ├── stack.py             # CDK stack (single source of truth for infra)
 │   └── deploy.py            # CDK synth → CloudFormation JSON → boto3 deploy
@@ -30,7 +30,8 @@ src/harbor_aws/
     ├── config.py            # AWSConfig dataclass, k8s client factory, stack loader
     ├── pods.py              # Kubernetes pod lifecycle (create, wait, delete)
     ├── exec.py              # Command execution via Kubernetes WebSocket exec
-    └── files.py             # File transfer via tar-over-exec
+    ├── files.py             # File transfer via tar-over-exec
+    └── watcher.py           # Watch-based pod status monitor (O(1) API calls)
 ```
 
 ## Quick Start
