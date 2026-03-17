@@ -2,7 +2,11 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks — one pod per task, isolated, ephemeral, pay-on-demand.
+AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks.
+
+- **One command infra:** `deploy` creates everything, `destroy` tears it down.
+- **Massive concurrency:** 500+ pods in parallel — one pod per task, fully isolated.
+- **Pay per second:** EKS Fargate bills only while pods run; no idle compute.
 
 ![Architecture](https://raw.githubusercontent.com/JackXu0/harbor-aws/main/docs/architecture.png)
 
