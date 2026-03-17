@@ -1,8 +1,7 @@
 """Watch-based pod status monitor.
 
-Replaces per-pod polling with a single K8s watch stream that pushes status
-updates to asyncio.Event waiters.  Reduces API server load from O(n) calls
-per interval to O(1) regardless of pod count.
+A single K8s watch stream monitors all harbor-aws pods and pushes status
+updates to asyncio.Event waiters — O(1) API calls regardless of pod count.
 """
 
 from __future__ import annotations
@@ -17,15 +16,6 @@ from kubernetes import client, watch
 from kubernetes import config as k8s_config
 
 logger = logging.getLogger(__name__)
-
-# Diagnostic file logger — writes to /tmp/watcher_diag.log regardless of
-# Harbor's log configuration.  Remove once the watcher is validated at scale.
-_diag = logging.getLogger("watcher_diag")
-_diag.setLevel(logging.DEBUG)
-if not _diag.handlers:
-    _fh = logging.FileHandler("/tmp/watcher_diag.log", mode="w")
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _diag.addHandler(_fh)
 
 # Server-side watch timeout — the API server closes the stream after this
 # many seconds, and we reconnect with the last resource_version.
@@ -111,7 +101,7 @@ class PodWatcher:
         with self._handles_lock:
             if pod_name in self._handles:
                 h = self._handles[pod_name]
-                _diag.debug("REGISTER %s (existing) img=%s run=%s", pod_name, h.image_pulled.is_set(), h.pod_running.is_set())
+
                 return h
 
             handle = _PodWaitHandle()
@@ -122,9 +112,6 @@ class PodWatcher:
             cached_pod = self._cached_statuses.pop(pod_name, None)
             if cached_pod is not None:
                 self._evaluate_pod(handle, pod_name, cached_pod)
-                _diag.debug("REGISTER %s (new, from cache) img=%s run=%s", pod_name, handle.image_pulled.is_set(), handle.pod_running.is_set())
-            else:
-                _diag.debug("REGISTER %s (new, no cache)", pod_name)
 
             return handle
 
@@ -162,7 +149,6 @@ class PodWatcher:
             return
 
         self._started.set()
-        _diag.info("STARTED namespace=%s rv=%s", self._namespace, self._resource_version)
         logger.info("PodWatcher started (namespace=%s)", self._namespace)
 
         while not self._stopped.is_set():
@@ -177,7 +163,6 @@ class PodWatcher:
                 if self._resource_version:
                     kwargs["resource_version"] = self._resource_version
 
-                _diag.info("WATCH connecting rv=%s", self._resource_version)
                 event_count = 0
                 for event in w.stream(api.list_namespaced_pod, **kwargs):
                     if self._stopped.is_set():
@@ -185,9 +170,7 @@ class PodWatcher:
                         return
                     event_count += 1
                     self._process_event(event)
-                _diag.info("WATCH stream ended after %d events", event_count)
             except client.ApiException as e:
-                _diag.warning("WATCH ApiException %d", e.status)
                 if e.status == 410:
                     # resource_version too old — re-list
                     logger.debug("Watch 410 Gone, re-listing")
@@ -200,8 +183,7 @@ class PodWatcher:
                 else:
                     logger.warning("Watch ApiException %d, reconnecting in 2s", e.status)
                     time.sleep(2)
-            except Exception as exc:
-                _diag.warning("WATCH exception: %s", exc)
+            except Exception:
                 if not self._stopped.is_set():
                     logger.warning("Watch stream error, reconnecting in 2s", exc_info=True)
                     time.sleep(2)
@@ -233,12 +215,10 @@ class PodWatcher:
         event_type: str = event["type"]
         pod: client.V1Pod = event["object"]
         pod_name: str = pod.metadata.name
-        phase = pod.status.phase if pod.status else None
         self._resource_version = pod.metadata.resource_version
 
         with self._handles_lock:
             handle = self._handles.get(pod_name)
-            has_handle = handle is not None
 
             if event_type == "DELETED":
                 if handle is not None:
@@ -246,20 +226,13 @@ class PodWatcher:
                     self._set_event(handle.image_pulled)
                     self._set_event(handle.pod_running)
                 self._cached_statuses.pop(pod_name, None)
-                _diag.debug("EVENT %s %s phase=%s handle=%s", event_type, pod_name, phase, has_handle)
                 return
 
             # ADDED or MODIFIED
             if handle is not None:
                 self._evaluate_pod(handle, pod_name, pod)
-                _diag.debug(
-                    "EVENT %s %s phase=%s img_set=%s run_set=%s",
-                    event_type, pod_name, phase,
-                    handle.image_pulled.is_set(), handle.pod_running.is_set(),
-                )
             else:
                 self._cached_statuses[pod_name] = pod
-                _diag.debug("EVENT %s %s phase=%s -> cached (no handle)", event_type, pod_name, phase)
 
     # ------------------------------------------------------------------
     # Condition evaluation

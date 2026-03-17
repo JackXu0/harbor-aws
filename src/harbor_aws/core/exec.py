@@ -176,7 +176,15 @@ async def exec_command(
             except Exception as e:
                 last_exc = e
                 err_str = str(e)
-                is_transient = "Handshake status" in err_str or "Unauthorized" in err_str
+                is_transient = any(s in err_str for s in (
+                    "Handshake status",
+                    "Unauthorized",
+                    "nodename nor servname",  # DNS resolution failure
+                    "Name or service not known",  # DNS (Linux)
+                    "Connection refused",
+                    "Connection reset",
+                    "timed out",
+                ))
                 if is_transient and attempt < _EXEC_MAX_RETRIES - 1:
                     delay = _EXEC_RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
@@ -184,6 +192,11 @@ async def exec_command(
                         pod_name, attempt + 1, _EXEC_MAX_RETRIES,
                         type(e).__name__, delay, err_str[:120],
                     )
+                    # Refresh kubeconfig on auth/connection errors
+                    try:
+                        k8s_config.load_kube_config()
+                    except Exception:
+                        pass
                     time.sleep(delay)
                     continue
                 if "Handshake status" in err_str:

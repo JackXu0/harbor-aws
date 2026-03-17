@@ -18,6 +18,23 @@ from kubernetes import client
 from harbor_aws.core import exec, files, pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
 
+# Fargate resource profiles for known benchmark images.
+# Matched top-to-bottom by regex against the docker image URI.
+# If no pattern matches, the benchmark's own defaults are used.
+_RESOURCE_PROFILES: list[tuple[str, int, int]] = [
+    # (image_pattern,  cpus,  memory_mb)
+    # SWE-bench — Go/JS repos need extra CPU for dependency compilation
+    (r"swebench/sweb\.eval", 2, 8192),
+]
+
+
+def _match_resource_profile(image: str) -> tuple[int, int] | None:
+    """Return (cpus, memory_mb) if *image* matches a known profile."""
+    for pattern, cpus, mem in _RESOURCE_PROFILES:
+        if re.search(pattern, image):
+            return cpus, mem
+    return None
+
 
 class AWSEnvironment(BaseEnvironment):
     """AWS EKS/Fargate implementation for Harbor sandboxes.
@@ -44,6 +61,8 @@ class AWSEnvironment(BaseEnvironment):
         eks_cluster_name: str = "harbor-aws",
         namespace: str = "harbor",
         ecr_cache: bool = False,
+        cpus: int | None = None,
+        memory_mb: int | None = None,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -65,6 +84,10 @@ class AWSEnvironment(BaseEnvironment):
             namespace=namespace,
             ecr_cache=ecr_cache,
         )
+
+        # Optional resource overrides (override benchmark defaults)
+        self._cpus_override = int(cpus) if cpus is not None else None
+        self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
@@ -281,6 +304,11 @@ class AWSEnvironment(BaseEnvironment):
             image_uri = self._ecr_image_uri(image_uri)
         self.logger.debug("Using image: %s", image_uri)
 
+        # Resource priority: explicit override > image profile > benchmark default
+        profile = _match_resource_profile(image_uri)
+        pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
+        pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
+
         # Limit concurrent image pulls.  With ECR cache: 500 (no rate limits).
         # Without: 50 (Docker Hub rate limits).  The semaphore is released once
         # the image is pulled, so Fargate scheduling doesn't block other pods.
@@ -292,8 +320,8 @@ class AWSEnvironment(BaseEnvironment):
                 image_uri,
                 self.environment_name,
                 self.session_id,
-                cpus=self.task_env_config.cpus,
-                memory_mb=self.task_env_config.memory_mb,
+                cpus=pod_cpus,
+                memory_mb=pod_memory,
                 image_pull_secret=AWSEnvironment._docker_secret_name,
             )
             self.logger.debug("[start] pod created: %s", self._pod_name)

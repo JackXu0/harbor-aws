@@ -1,5 +1,11 @@
+# Fargate pods are slower than bare metal — generous timeouts avoid
+# false failures on benchmarks with heavy setup (Go modules, npm install).
+timeout_multiplier: 3.0
+agent_setup_timeout_multiplier: 3.0
+
 environment:
   import_path: "harbor_aws.adapter:AWSEnvironment"
   kwargs:
     stack_name: harbor-aws
     region: us-east-1
+    ecr_cache: true
