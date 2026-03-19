@@ -45,7 +45,9 @@ Image pulls are capped at 50 concurrent operations by default to avoid Docker Hu
 
 <br>
 
-**1. Create the Docker Hub secret in Secrets Manager (before `deploy`):**
+During `deploy`, you'll be prompted to provide Docker Hub credentials. If provided, the deploy will automatically create the Secrets Manager secret and ECR cache rule.
+
+To set it up manually instead:
 
 ```bash
 aws secretsmanager create-secret \
@@ -54,9 +56,7 @@ aws secretsmanager create-secret \
   --region us-east-1
 ```
 
-The CDK stack automatically creates the ECR cache rule using this secret.
-
-**2. Enable in job config:**
+Then enable in job config:
 
 ```yaml
 environment:
