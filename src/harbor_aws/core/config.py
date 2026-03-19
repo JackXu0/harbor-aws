@@ -1,4 +1,4 @@
-"""Configuration for AWS EKS/Fargate backend."""
+"""AWS config, Kubernetes client, and CloudFormation stack loader."""
 
 from __future__ import annotations
 
@@ -75,20 +75,19 @@ class _RefreshingK8sClient:
 
 
 _kubeconfig_lock = threading.Lock()
-_kubeconfig_initialized = False
+_kubeconfig_updated = False
 
 
 def create_k8s_client(config: AWSConfig) -> _RefreshingK8sClient:
     """Create a Kubernetes CoreV1Api client configured for the EKS cluster.
 
-    Updates kubeconfig via AWS CLI, then loads it with the kubernetes library.
-    Returns a proxy that auto-refreshes the EKS token before expiry.
-    Thread-safe: only the first call updates kubeconfig.
+    Always updates kubeconfig on first call (idempotent, ensures correct
+    account context). Returns a proxy that auto-refreshes the EKS token.
     """
-    global _kubeconfig_initialized
+    global _kubeconfig_updated
 
     with _kubeconfig_lock:
-        if not _kubeconfig_initialized:
+        if not _kubeconfig_updated:
             cmd = [
                 "aws", "eks", "update-kubeconfig",
                 "--name", config.eks_cluster_name,
@@ -98,7 +97,7 @@ def create_k8s_client(config: AWSConfig) -> _RefreshingK8sClient:
                 cmd += ["--profile", config.profile_name]
 
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            _kubeconfig_initialized = True
+            _kubeconfig_updated = True
 
     client = _RefreshingK8sClient()
     # Force an initial token load
