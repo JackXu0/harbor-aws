@@ -37,6 +37,7 @@ class HarborAWSStack(cdk.Stack):
         stack_prefix: str = "harbor-aws",
         runner_account_ids: list[str] | None = None,
         docker_hub_secret_arn: str | None = None,
+        cluster_admin_role_arn: str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -91,6 +92,14 @@ class HarborAWSStack(cdk.Stack):
             ),
         )
 
+        # Grant the deployer's IAM role cluster admin access.
+        # CDK creates the cluster via its own deploy role, so the caller's
+        # role needs to be explicitly added to aws-auth for kubectl access.
+        if cluster_admin_role_arn:
+            cluster.aws_auth.add_masters_role(
+                iam.Role.from_role_arn(self, "ClusterAdminRole", cluster_admin_role_arn)
+            )
+
         # Grant ECR pull-through cache permissions to Fargate pod execution roles.
         # Without these, first-pull cache misses fail because the role can't
         # create ECR repos or import upstream images on behalf of the pod.
@@ -105,15 +114,13 @@ class HarborAWSStack(cdk.Stack):
                 )
 
         # Patch CoreDNS to run on Fargate (remove ec2 compute-type annotation)
-        coredns_patch = cluster.add_manifest(
+        eks.KubernetesPatch(
+            self,
             "CoreDnsFargatePatch",
-            {
-                "apiVersion": "apps/v1",
-                "kind": "Deployment",
-                "metadata": {
-                    "name": "coredns",
-                    "namespace": "kube-system",
-                },
+            cluster=cluster,
+            resource_name="deployment/coredns",
+            resource_namespace="kube-system",
+            apply_patch={
                 "spec": {
                     "template": {
                         "metadata": {
@@ -124,6 +131,18 @@ class HarborAWSStack(cdk.Stack):
                     },
                 },
             },
+            restore_patch={
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "eks.amazonaws.com/compute-type": "ec2",
+                            },
+                        },
+                    },
+                },
+            },
+            patch_type=eks.PatchType.STRATEGIC,
         )
 
         # ============================================================
