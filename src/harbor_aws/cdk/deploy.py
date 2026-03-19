@@ -13,6 +13,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,15 @@ def _find_cdk() -> str:
     raise RuntimeError("CDK CLI not found. Install with: npm install -g aws-cdk")
 
 
-def _write_cdk_app(stack_prefix: str, out_dir: str) -> str:
+def _write_cdk_app(
+    stack_prefix: str,
+    out_dir: str,
+    docker_hub_secret_arn: str | None = None,
+) -> str:
     """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
     # Resolve the src directory so the CDK app can import harbor_aws
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    secret_repr = repr(docker_hub_secret_arn) if docker_hub_secret_arn else "None"
     app_code = f"""\
 import aws_cdk as cdk
 import sys
@@ -38,7 +44,11 @@ sys.path.insert(0, "{src_dir}")
 from harbor_aws.cdk.stack import HarborAWSStack
 
 app = cdk.App()
-HarborAWSStack(app, "{stack_prefix}", stack_prefix="{stack_prefix}")
+HarborAWSStack(
+    app, "{stack_prefix}",
+    stack_prefix="{stack_prefix}",
+    docker_hub_secret_arn={secret_repr},
+)
 app.synth()
 """
     app_path = os.path.join(out_dir, "app.py")
@@ -64,8 +74,13 @@ async def deploy(
     """
     import boto3
 
+    # Check for Docker Hub credentials before the long deploy
+    session = boto3.Session(profile_name=profile_name, region_name=region)
+    docker_hub_secret_arn = _find_docker_hub_secret(session)
+    if not docker_hub_secret_arn:
+        docker_hub_secret_arn = _prompt_docker_hub_credentials(session)
+
     def _deploy() -> dict[str, str]:
-        session = boto3.Session(profile_name=profile_name, region_name=region)
         cdk_cmd = _find_cdk()
 
         # First, bootstrap CDK if needed
@@ -73,7 +88,7 @@ async def deploy(
 
         # Deploy via CDK CLI
         with tempfile.TemporaryDirectory() as tmp_dir:
-            _write_cdk_app(stack_prefix, tmp_dir)
+            _write_cdk_app(stack_prefix, tmp_dir, docker_hub_secret_arn)
 
             env = os.environ.copy()
             env["AWS_DEFAULT_REGION"] = region
@@ -82,7 +97,7 @@ async def deploy(
 
             logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
 
-            app_arg = f"python {os.path.join(tmp_dir, 'app.py')}"
+            app_arg = f"{sys.executable} {os.path.join(tmp_dir, 'app.py')}"
             cmd = f"{cdk_cmd} deploy --app {shlex.quote(app_arg)} --require-approval never --outputs-file {shlex.quote(os.path.join(tmp_dir, 'outputs.json'))}"
             result = subprocess.run(
                 cmd,
@@ -95,8 +110,8 @@ async def deploy(
             )
 
             if result.returncode != 0:
-                logger.error("CDK deploy stderr:\n%s", result.stderr[-2000:] if result.stderr else "")
-                raise RuntimeError(f"CDK deploy failed (exit code {result.returncode})")
+                stderr = result.stderr[-2000:] if result.stderr else "(no output)"
+                raise RuntimeError(f"CDK deploy failed:\n{stderr}")
 
             # Read outputs from CDK output file
             outputs_file = os.path.join(tmp_dir, "outputs.json")
@@ -153,6 +168,45 @@ def _ensure_cdk_bootstrap(region: str, profile_name: str | None, cdk_cmd: str) -
             f"stderr: {result.stderr[-1000:] if result.stderr else ''}"
         )
     logger.info("CDK bootstrap complete.")
+
+
+def _prompt_docker_hub_credentials(session: object) -> str | None:
+    """Prompt the user to optionally provide Docker Hub credentials for ECR pull-through cache."""
+    import getpass
+
+    print("\nECR pull-through cache avoids Docker Hub rate limits at high concurrency.")
+    print("Provide Docker Hub credentials to enable it, or skip.\n")
+    answer = input("Set up ECR pull-through cache? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Skipping — pods will pull directly from Docker Hub.\n")
+        return None
+
+    username = input("Docker Hub username: ").strip()
+    token = getpass.getpass("Docker Hub access token: ").strip()
+    if not username or not token:
+        print("Empty credentials — skipping ECR pull-through cache.\n")
+        return None
+
+    import json
+
+    sm = session.client("secretsmanager")  # type: ignore[union-attr]
+    secret_name = "ecr-pullthroughcache/docker-hub"
+    secret_value = json.dumps({"username": username, "accessToken": token})
+    resp = sm.create_secret(Name=secret_name, SecretString=secret_value)
+    arn = resp["ARN"]
+    print(f"Created secret: {secret_name}\n")
+    return arn
+
+
+def _find_docker_hub_secret(session: object) -> str | None:
+    """Return the ARN of the Docker Hub secret if it exists, else None."""
+    sm = session.client("secretsmanager")  # type: ignore[union-attr]
+    try:
+        resp = sm.describe_secret(SecretId="ecr-pullthroughcache/docker-hub")
+        print("ECR pull-through cache: enabled (Docker Hub credentials found).")
+        return resp["ARN"]
+    except Exception:
+        return None
 
 
 def _get_outputs(cfn: object, stack_name: str) -> dict[str, str]:

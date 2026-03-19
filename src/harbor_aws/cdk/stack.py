@@ -35,6 +35,7 @@ class HarborAWSStack(cdk.Stack):
         construct_id: str,
         *,
         stack_prefix: str = "harbor-aws",
+        docker_hub_secret_arn: str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -182,25 +183,19 @@ class HarborAWSStack(cdk.Stack):
         )
 
         # ============================================================
-        # ECR Pull-Through Cache for Docker Hub
-        # Pods pull from ECR instead of Docker Hub — no rate limits,
-        # same-region speed, no NAT data transfer costs (with VPC endpoint).
-        # First pull of an image is a cache miss (fetches from Docker Hub),
-        # subsequent pulls hit ECR directly. ECR checks for updates every 24h.
+        # ECR Pull-Through Cache for Docker Hub (optional)
+        # Requires a Secrets Manager secret with Docker Hub credentials.
+        # Without it, pods pull directly from Docker Hub (may hit rate limits).
         # ============================================================
 
-        # The credential secret must be created manually before deploying
-        # (it contains the user's Docker Hub credentials — see README).
-        docker_hub_secret_name = "ecr-pullthroughcache/docker-hub"
-        docker_hub_secret = f"arn:aws:secretsmanager:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:secret:{docker_hub_secret_name}"
-
-        ecr.CfnPullThroughCacheRule(
-            self,
-            "DockerHubCache",
-            ecr_repository_prefix="docker-hub",
-            upstream_registry_url="registry-1.docker.io",
-            credential_arn=docker_hub_secret,
-        )
+        if docker_hub_secret_arn:
+            ecr.CfnPullThroughCacheRule(
+                self,
+                "DockerHubCache",
+                ecr_repository_prefix="docker-hub",
+                upstream_registry_url="registry-1.docker.io",
+                credential_arn=docker_hub_secret_arn,
+            )
 
         # VPC endpoint for ECR — pods pull images without going through NAT
         vpc.add_interface_endpoint(
