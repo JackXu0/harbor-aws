@@ -35,6 +35,7 @@ class HarborAWSStack(cdk.Stack):
         construct_id: str,
         *,
         stack_prefix: str = "harbor-aws",
+        runner_account_ids: list[str] | None = None,
         docker_hub_secret_arn: str | None = None,
         **kwargs: object,
     ) -> None:
@@ -210,6 +211,67 @@ class HarborAWSStack(cdk.Stack):
             "S3Endpoint",
             service=ec2.GatewayVpcEndpointAwsService.S3,
         )
+
+        # ============================================================
+        # Cross-Account Runner Role (optional)
+        # Allows specified AWS accounts to assume a scoped role for
+        # running benchmarks without deployer-level permissions.
+        # ============================================================
+
+        if runner_account_ids:
+            runner_role = iam.Role(
+                self,
+                "RunnerRole",
+                role_name=f"{stack_prefix}-runner",
+                assumed_by=iam.CompositePrincipal(
+                    *[iam.AccountPrincipal(acc) for acc in runner_account_ids]
+                ),
+                max_session_duration=cdk.Duration.hours(12),
+            )
+
+            runner_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="EKSAccess",
+                    actions=["eks:DescribeCluster", "eks:AccessKubernetesApi"],
+                    resources=[cluster.cluster_arn],
+                )
+            )
+
+            runner_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="StackConfig",
+                    actions=["cloudformation:DescribeStacks"],
+                    resources=[cdk.Aws.STACK_ID],
+                )
+            )
+
+            runner_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="Identity",
+                    actions=["sts:GetCallerIdentity"],
+                    resources=["*"],
+                )
+            )
+
+            runner_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ECRPull",
+                    actions=[
+                        "ecr:GetAuthorizationToken",
+                        "ecr:BatchGetImage",
+                        "ecr:GetDownloadUrlForLayer",
+                    ],
+                    resources=["*"],
+                )
+            )
+
+            # Grant the runner role Kubernetes RBAC access to the harbor namespace
+            cluster.aws_auth.add_role_mapping(
+                runner_role,
+                groups=["system:masters"],
+            )
+
+            cdk.CfnOutput(self, "RunnerRoleArn", value=runner_role.role_arn)
 
         # ============================================================
         # Outputs
