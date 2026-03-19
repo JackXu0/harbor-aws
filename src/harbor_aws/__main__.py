@@ -131,25 +131,27 @@ async def _stop(args: argparse.Namespace) -> None:
 
 
 async def _destroy(args: argparse.Namespace) -> None:
-    import boto3
+    import asyncio
 
-    session = boto3.Session(profile_name=args.profile, region_name=args.region)
-    cfn = session.client("cloudformation")
+    from harbor_aws.cdk.destroy import destroy, get_destroy_summary
 
     try:
-        response = cfn.describe_stacks(StackName=args.stack_name)
-        stack = response["Stacks"][0]
-        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        summary = get_destroy_summary(args.stack_name, args.region, args.profile)
     except Exception as e:
         if "does not exist" in str(e):
             print(f"Stack '{args.stack_name}' does not exist.")
             return
         raise
 
+    outputs = summary["outputs"]
+    ecr_count = summary["ecr_repo_count"]
+
     print(f"This will delete all harbor-aws resources in {args.region}:")
     print(f"  Stack:      {args.stack_name}")
     if outputs.get("EksClusterName"):
         print(f"  EKS:        cluster '{outputs['EksClusterName']}' (+ delete pods)")
+    if ecr_count:
+        print(f"  ECR:        {ecr_count} pull-through cache repos (docker-hub/*)")
     print(f"  + VPC, IAM roles, log groups")
 
     if not args.yes:
@@ -158,19 +160,14 @@ async def _destroy(args: argparse.Namespace) -> None:
             print("Cancelled.")
             return
 
-    # 1. Delete all pods in the namespace
+    # Delete pods first (best-effort)
     try:
         await _stop(args)
     except Exception:
         pass
 
-    # 2. Delete the CloudFormation stack
-    print("Deleting CloudFormation stack (this may take 10-15 minutes for EKS)...")
-    cfn.delete_stack(StackName=args.stack_name)
-    waiter = cfn.get_waiter("stack_delete_complete")
-    waiter.wait(StackName=args.stack_name, WaiterConfig={"Delay": 15, "MaxAttempts": 120})
-
-    print("All resources cleaned up.")
+    # Tear down infrastructure
+    await asyncio.to_thread(destroy, args.stack_name, args.region, args.profile)
 
 
 if __name__ == "__main__":
