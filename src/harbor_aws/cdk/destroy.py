@@ -27,9 +27,7 @@ def destroy(stack_name: str, region: str, profile_name: str | None = None) -> No
     if cluster_name:
         _delete_fargate_profiles(session, cluster_name)
 
-    ecr_repos = _list_ecr_cache_repos(session)
-    if ecr_repos:
-        _delete_ecr_cache_repos(session, ecr_repos)
+    _cleanup_ecr_cache(session)
 
     # Delete the stack (with retry for stuck resources)
     print("Deleting CloudFormation stack (this may take 10-15 minutes for EKS)...")
@@ -89,15 +87,27 @@ def _list_ecr_cache_repos(session: boto3.Session) -> list[str]:
     return repos
 
 
-def _delete_ecr_cache_repos(session: boto3.Session, repos: list[str]) -> None:
+def _cleanup_ecr_cache(session: boto3.Session) -> None:
+    """Delete ECR pull-through cache rule and any cached repos."""
     ecr = session.client("ecr")
-    print(f"Deleting {len(repos)} ECR pull-through cache repos...")
-    for name in repos:
-        try:
-            ecr.delete_repository(repositoryName=name, force=True)
-        except Exception as e:
-            logger.warning("Failed to delete ECR repo %s: %s", name, e)
-    print("ECR cache repos deleted.")
+
+    # Delete cached repos (created at runtime, not managed by CloudFormation)
+    repos = _list_ecr_cache_repos(session)
+    if repos:
+        print(f"Deleting {len(repos)} ECR pull-through cache repos...")
+        for name in repos:
+            try:
+                ecr.delete_repository(repositoryName=name, force=True)
+            except Exception as e:
+                logger.warning("Failed to delete ECR repo %s: %s", name, e)
+        print("ECR cache repos deleted.")
+
+    # Delete the cache rule itself
+    try:
+        ecr.delete_pull_through_cache_rule(ecrRepositoryPrefix="docker-hub")
+        print("ECR pull-through cache rule deleted.")
+    except Exception:
+        pass  # Rule may not exist or already deleted by CloudFormation
 
 
 def _wait_for_stack_delete(cfn: Any, stack_name: str) -> str | None:
