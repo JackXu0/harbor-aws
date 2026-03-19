@@ -32,12 +32,14 @@ def _write_cdk_app(
     out_dir: str,
     runner_account_ids: list[str] | None = None,
     docker_hub_secret_arn: str | None = None,
+    cluster_admin_role_arn: str | None = None,
 ) -> str:
     """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
     # Resolve the src directory so the CDK app can import harbor_aws
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     runner_ids_repr = repr(runner_account_ids) if runner_account_ids else "None"
     secret_repr = repr(docker_hub_secret_arn) if docker_hub_secret_arn else "None"
+    admin_repr = repr(cluster_admin_role_arn) if cluster_admin_role_arn else "None"
     app_code = f"""\
 import aws_cdk as cdk
 import sys
@@ -50,6 +52,7 @@ HarborAWSStack(
     stack_prefix="{stack_prefix}",
     runner_account_ids={runner_ids_repr},
     docker_hub_secret_arn={secret_repr},
+    cluster_admin_role_arn={admin_repr},
 )
 app.synth()
 """
@@ -83,6 +86,9 @@ def deploy(
     if not docker_hub_secret_arn:
         docker_hub_secret_arn = _prompt_docker_hub_credentials(session)
 
+    # Detect caller's IAM role to grant EKS cluster admin access
+    cluster_admin_role_arn = _get_caller_role_arn(session)
+
     cdk_cmd = _find_cdk()
 
     # First, bootstrap CDK if needed
@@ -90,35 +96,36 @@ def deploy(
 
     # Deploy via CDK CLI
     with tempfile.TemporaryDirectory() as tmp_dir:
-        _write_cdk_app(stack_prefix, tmp_dir, runner_account_ids, docker_hub_secret_arn)
+        _write_cdk_app(stack_prefix, tmp_dir, runner_account_ids, docker_hub_secret_arn, cluster_admin_role_arn)
 
         env = os.environ.copy()
         env["AWS_DEFAULT_REGION"] = region
         if profile_name:
             env["AWS_PROFILE"] = profile_name
 
-        logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
+        print(f"Deploying stack '{stack_prefix}' in {region} (EKS takes ~15-20 minutes)...")
 
         app_arg = f"{sys.executable} {os.path.join(tmp_dir, 'app.py')}"
-        cmd = f"{cdk_cmd} deploy --app {shlex.quote(app_arg)} --require-approval never --outputs-file {shlex.quote(os.path.join(tmp_dir, 'outputs.json'))}"
+        outputs_path = os.path.join(tmp_dir, "outputs.json")
+        cmd = (
+            f"{cdk_cmd} deploy --app {shlex.quote(app_arg)}"
+            f" --require-approval never --outputs-file {shlex.quote(outputs_path)}"
+        )
         result = subprocess.run(
             cmd,
             shell=True,
             cwd=tmp_dir,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=1800,
+            stderr=subprocess.STDOUT,
         )
 
         if result.returncode != 0:
-            stderr = result.stderr[-2000:] if result.stderr else "(no output)"
-            raise RuntimeError(f"CDK deploy failed:\n{stderr}")
+            raise RuntimeError("CDK deploy failed (see output above)")
 
         # Read outputs from CDK output file
-        outputs_file = os.path.join(tmp_dir, "outputs.json")
-        if os.path.exists(outputs_file):
-            with open(outputs_file) as f:
+        if os.path.exists(outputs_path):
+            with open(outputs_path) as f:
                 all_outputs = json.load(f)
             # CDK outputs are nested under the stack name
             return all_outputs.get(stack_prefix, {})
@@ -129,31 +136,20 @@ def deploy(
 
 
 def _ensure_cdk_bootstrap(region: str, profile_name: str | None, cdk_cmd: str) -> None:
-    """Ensure CDK bootstrap stack exists."""
+    """Ensure CDK bootstrap stack exists and is up to date."""
     import boto3
 
     session = boto3.Session(profile_name=profile_name, region_name=region)
-    cfn = session.client("cloudformation")
-
-    try:
-        response = cfn.describe_stacks(StackName="CDKToolkit")
-        status = response["Stacks"][0]["StackStatus"]
-        if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
-            return  # Already bootstrapped
-    except Exception as e:
-        if "does not exist" not in str(e):
-            raise
-
-    # Get account ID for bootstrap
     sts = session.client("sts")
     account_id = sts.get_caller_identity()["Account"]
 
-    logger.info("CDK bootstrap not found. Running 'cdk bootstrap'...")
     env = os.environ.copy()
     env["AWS_DEFAULT_REGION"] = region
     if profile_name:
         env["AWS_PROFILE"] = profile_name
 
+    # Always run bootstrap — it's idempotent and upgrades if needed
+    print(f"Ensuring CDK bootstrap is up to date ({account_id}/{region})...")
     result = subprocess.run(
         f"{cdk_cmd} bootstrap aws://{account_id}/{region}",
         shell=True,
@@ -167,7 +163,6 @@ def _ensure_cdk_bootstrap(region: str, profile_name: str | None, cdk_cmd: str) -
             f"CDK bootstrap failed. Install CDK CLI: npm install -g aws-cdk\n"
             f"stderr: {result.stderr[-1000:] if result.stderr else ''}"
         )
-    logger.info("CDK bootstrap complete.")
 
 
 def _prompt_docker_hub_credentials(session: object) -> str | None:
@@ -196,6 +191,21 @@ def _prompt_docker_hub_credentials(session: object) -> str | None:
     arn = resp["ARN"]
     print(f"Created secret: {secret_name}\n")
     return arn
+
+
+def _get_caller_role_arn(session: object) -> str | None:
+    """Get the IAM role ARN of the current caller, for EKS cluster admin access."""
+    sts = session.client("sts")  # type: ignore[union-attr]
+    identity = sts.get_caller_identity()
+    arn = identity["Arn"]
+    # Assumed role ARNs look like: arn:aws:sts::ACCOUNT:assumed-role/ROLE_NAME/SESSION
+    # Convert to the IAM role ARN: arn:aws:iam::ACCOUNT:role/ROLE_NAME
+    if ":assumed-role/" in arn:
+        parts = arn.split(":")
+        account = parts[4]
+        role_name = parts[5].split("/")[1]
+        return f"arn:aws:iam::{account}:role/{role_name}"
+    return None
 
 
 def _find_docker_hub_secret(session: object) -> str | None:
