@@ -218,12 +218,16 @@ class AWSEnvironment(BaseEnvironment):
                 type="kubernetes.io/dockerconfigjson",
                 data={".dockerconfigjson": base64.b64encode(docker_cfg.read_bytes()).decode()},
             )
-            await asyncio.to_thread(
-                self._k8s_api.create_namespaced_secret,
-                namespace=self._aws_config.namespace,
-                body=secret,
-            )
-            self.logger.debug("Created %s secret from ~/.docker/config.json", secret_name)
+            try:
+                await asyncio.to_thread(
+                    self._k8s_api.create_namespaced_secret,
+                    namespace=self._aws_config.namespace,
+                    body=secret,
+                )
+                self.logger.debug("Created %s secret from ~/.docker/config.json", secret_name)
+            except client.ApiException as create_err:
+                if create_err.status != 409:  # 409 Conflict = already exists (race condition)
+                    raise
 
         AWSEnvironment._docker_secret_name = secret_name
         AWSEnvironment._docker_secret_checked = True
