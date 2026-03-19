@@ -10,7 +10,6 @@ Commands:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 import sys
 
@@ -29,6 +28,8 @@ def main() -> None:
     deploy_p.add_argument("--stack-name", default="harbor-aws", help="CloudFormation stack name (default: harbor-aws)")
     deploy_p.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1)")
     deploy_p.add_argument("--profile", default=None, help="AWS CLI profile name")
+    deploy_p.add_argument("--runner-account", action="append", default=None, dest="runner_accounts",
+                          help="AWS account ID allowed to assume the runner role (repeatable)")
 
     # status
     status_p = sub.add_parser("status", help="check infrastructure status")
@@ -58,26 +59,22 @@ def main() -> None:
     logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("kubernetes").setLevel(logging.WARNING)
 
-    if args.command == "deploy":
-        asyncio.run(_deploy(args))
-    elif args.command == "status":
-        asyncio.run(_status(args))
-    elif args.command == "stop":
-        asyncio.run(_stop(args))
-    elif args.command == "destroy":
-        asyncio.run(_destroy(args))
+    commands = {"deploy": _deploy, "status": _status, "stop": _stop, "destroy": _destroy}
+    if args.command in commands:
+        commands[args.command](args)
     else:
         parser.print_help()
         sys.exit(1)
 
 
-async def _deploy(args: argparse.Namespace) -> None:
+def _deploy(args: argparse.Namespace) -> None:
     from harbor_aws.cdk.deploy import deploy
 
-    outputs = await deploy(
+    outputs = deploy(
         stack_prefix=args.stack_name,
         region=args.region,
         profile_name=args.profile,
+        runner_account_ids=args.runner_accounts,
     )
     print("\nStack outputs:")
     for key, value in sorted(outputs.items()):
@@ -85,7 +82,7 @@ async def _deploy(args: argparse.Namespace) -> None:
     print(f"\nUse with Harbor:\n  harbor trials start -p ./task \\\n    --environment-import-path harbor_aws.adapter:AWSEnvironment \\\n    --ek stack_name={args.stack_name} --ek region={args.region}")
 
 
-async def _status(args: argparse.Namespace) -> None:
+def _status(args: argparse.Namespace) -> None:
     import boto3
 
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
@@ -109,30 +106,30 @@ async def _status(args: argparse.Namespace) -> None:
             raise
 
 
-async def _stop(args: argparse.Namespace) -> None:
-    from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
+def _stop(args: argparse.Namespace) -> None:
+    import asyncio
+
+    from harbor_aws.core.config import create_k8s_client, load_config_from_stack
     from harbor_aws.core.pods import delete_pod, list_pods
 
-    config = await load_config_from_stack(
+    config = asyncio.run(load_config_from_stack(
         stack_name=args.stack_name,
         region=args.region,
         profile_name=args.profile,
-    )
+    ))
     api = create_k8s_client(config)
 
-    pod_names = await list_pods(api, config)
+    pod_names = asyncio.run(list_pods(api, config))
     if not pod_names:
         print("No running pods.")
         return
 
     for name in pod_names:
-        await delete_pod(api, config, name)
+        asyncio.run(delete_pod(api, config, name))
     print(f"Deleted {len(pod_names)} pod(s). Infrastructure ready for next run.")
 
 
-async def _destroy(args: argparse.Namespace) -> None:
-    import asyncio
-
+def _destroy(args: argparse.Namespace) -> None:
     from harbor_aws.cdk.destroy import destroy, get_destroy_summary
 
     try:
@@ -162,12 +159,12 @@ async def _destroy(args: argparse.Namespace) -> None:
 
     # Delete pods first (best-effort)
     try:
-        await _stop(args)
+        _stop(args)
     except Exception:
         pass
 
     # Tear down infrastructure
-    await asyncio.to_thread(destroy, args.stack_name, args.region, args.profile)
+    destroy(args.stack_name, args.region, args.profile)
 
 
 if __name__ == "__main__":

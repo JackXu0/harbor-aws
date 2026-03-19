@@ -6,7 +6,6 @@ This module uses `cdk deploy` which handles bootstrap assets automatically.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -31,11 +30,13 @@ def _find_cdk() -> str:
 def _write_cdk_app(
     stack_prefix: str,
     out_dir: str,
+    runner_account_ids: list[str] | None = None,
     docker_hub_secret_arn: str | None = None,
 ) -> str:
     """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
     # Resolve the src directory so the CDK app can import harbor_aws
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    runner_ids_repr = repr(runner_account_ids) if runner_account_ids else "None"
     secret_repr = repr(docker_hub_secret_arn) if docker_hub_secret_arn else "None"
     app_code = f"""\
 import aws_cdk as cdk
@@ -47,6 +48,7 @@ app = cdk.App()
 HarborAWSStack(
     app, "{stack_prefix}",
     stack_prefix="{stack_prefix}",
+    runner_account_ids={runner_ids_repr},
     docker_hub_secret_arn={secret_repr},
 )
 app.synth()
@@ -63,10 +65,11 @@ app.synth()
     return out_dir
 
 
-async def deploy(
+def deploy(
     stack_prefix: str = "harbor-aws",
     region: str = "us-east-1",
     profile_name: str | None = None,
+    runner_account_ids: list[str] | None = None,
 ) -> dict[str, str]:
     """Deploy harbor-aws EKS infrastructure. Returns stack outputs.
 
@@ -80,52 +83,49 @@ async def deploy(
     if not docker_hub_secret_arn:
         docker_hub_secret_arn = _prompt_docker_hub_credentials(session)
 
-    def _deploy() -> dict[str, str]:
-        cdk_cmd = _find_cdk()
+    cdk_cmd = _find_cdk()
 
-        # First, bootstrap CDK if needed
-        _ensure_cdk_bootstrap(region, profile_name, cdk_cmd)
+    # First, bootstrap CDK if needed
+    _ensure_cdk_bootstrap(region, profile_name, cdk_cmd)
 
-        # Deploy via CDK CLI
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            _write_cdk_app(stack_prefix, tmp_dir, docker_hub_secret_arn)
+    # Deploy via CDK CLI
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _write_cdk_app(stack_prefix, tmp_dir, runner_account_ids, docker_hub_secret_arn)
 
-            env = os.environ.copy()
-            env["AWS_DEFAULT_REGION"] = region
-            if profile_name:
-                env["AWS_PROFILE"] = profile_name
+        env = os.environ.copy()
+        env["AWS_DEFAULT_REGION"] = region
+        if profile_name:
+            env["AWS_PROFILE"] = profile_name
 
-            logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
+        logger.info("Deploying stack '%s' in %s (EKS takes ~15-20 minutes)...", stack_prefix, region)
 
-            app_arg = f"{sys.executable} {os.path.join(tmp_dir, 'app.py')}"
-            cmd = f"{cdk_cmd} deploy --app {shlex.quote(app_arg)} --require-approval never --outputs-file {shlex.quote(os.path.join(tmp_dir, 'outputs.json'))}"
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=tmp_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=1800,
-            )
+        app_arg = f"{sys.executable} {os.path.join(tmp_dir, 'app.py')}"
+        cmd = f"{cdk_cmd} deploy --app {shlex.quote(app_arg)} --require-approval never --outputs-file {shlex.quote(os.path.join(tmp_dir, 'outputs.json'))}"
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=tmp_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
 
-            if result.returncode != 0:
-                stderr = result.stderr[-2000:] if result.stderr else "(no output)"
-                raise RuntimeError(f"CDK deploy failed:\n{stderr}")
+        if result.returncode != 0:
+            stderr = result.stderr[-2000:] if result.stderr else "(no output)"
+            raise RuntimeError(f"CDK deploy failed:\n{stderr}")
 
-            # Read outputs from CDK output file
-            outputs_file = os.path.join(tmp_dir, "outputs.json")
-            if os.path.exists(outputs_file):
-                with open(outputs_file) as f:
-                    all_outputs = json.load(f)
-                # CDK outputs are nested under the stack name
-                return all_outputs.get(stack_prefix, {})
+        # Read outputs from CDK output file
+        outputs_file = os.path.join(tmp_dir, "outputs.json")
+        if os.path.exists(outputs_file):
+            with open(outputs_file) as f:
+                all_outputs = json.load(f)
+            # CDK outputs are nested under the stack name
+            return all_outputs.get(stack_prefix, {})
 
-        # Fallback: read from CloudFormation
-        cfn = session.client("cloudformation")
-        return _get_outputs(cfn, stack_prefix)
-
-    return await asyncio.to_thread(_deploy)
+    # Fallback: read from CloudFormation
+    cfn = session.client("cloudformation")
+    return _get_outputs(cfn, stack_prefix)
 
 
 def _ensure_cdk_bootstrap(region: str, profile_name: str | None, cdk_cmd: str) -> None:
