@@ -60,6 +60,7 @@ class AWSEnvironment(BaseEnvironment):
         stack_name: str = "harbor-aws",
         eks_cluster_name: str = "harbor-aws",
         namespace: str = "harbor",
+        service_account_name: str = "harbor-pod",
         ecr_cache: bool = False,
         cpus: int | None = None,
         memory_mb: int | None = None,
@@ -82,6 +83,7 @@ class AWSEnvironment(BaseEnvironment):
             stack_name=stack_name,
             eks_cluster_name=eks_cluster_name,
             namespace=namespace,
+            service_account_name=service_account_name,
             ecr_cache=ecr_cache,
         )
 
