@@ -127,12 +127,14 @@ class AWSEnvironment(BaseEnvironment):
             else:
                 self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
                 ecr_cache = self._aws_config.ecr_cache
+                sa_name = self._aws_config.service_account_name
                 self._aws_config = await load_config_from_stack(
                     stack_name=self._aws_config.stack_name,
                     region=self._aws_config.region,
                     profile_name=self._aws_config.profile_name,
                 )
                 self._aws_config.ecr_cache = ecr_cache
+                self._aws_config.service_account_name = sa_name
                 AWSEnvironment._cached_stack_config = self._aws_config
         else:
             self._aws_config.validate()
