@@ -10,11 +10,25 @@ import time
 from dataclasses import dataclass
 
 import boto3
+from kubernetes import client
+from kubernetes import config as k8s_config
 
 logger = logging.getLogger(__name__)
 
-# EKS tokens expire after 15 minutes; refresh after 10 minutes to be safe
+# EKS tokens expire after 15 minutes; refresh every 10 minutes
 _TOKEN_REFRESH_INTERVAL = 600
+_kubeconfig_lock = threading.Lock()
+_kubeconfig_loaded_at: float = 0
+
+
+def ensure_fresh_kubeconfig() -> None:
+    """Reload kubeconfig if the EKS token is stale. Thread-safe."""
+    global _kubeconfig_loaded_at
+    with _kubeconfig_lock:
+        if time.monotonic() - _kubeconfig_loaded_at > _TOKEN_REFRESH_INTERVAL:
+            k8s_config.load_kube_config()
+            _kubeconfig_loaded_at = time.monotonic()
+            logger.debug("Refreshed kubeconfig token")
 
 
 @dataclass
@@ -47,47 +61,19 @@ class AWSConfig:
             )
 
 
-class _RefreshingK8sClient:
-    """CoreV1Api proxy that auto-refreshes the EKS token before expiry.
+_kubeconfig_setup = False
 
-    EKS tokens expire after 15 minutes. This recreates the client every
-    10 minutes. Thread-safe and shared across all AWSEnvironment instances.
+
+def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
+    """Create a Kubernetes CoreV1Api client for the EKS cluster.
+
+    First call runs 'aws eks update-kubeconfig'. Returns a standard CoreV1Api.
+    Call ensure_fresh_kubeconfig() before making API calls if tokens may be stale.
     """
-
-    _lock = threading.Lock()
-    _api: object | None = None
-    _created_at: float = 0
-
-    def _refresh(self) -> None:
-        from kubernetes import client
-        from kubernetes import config as k8s_config
-
-        k8s_config.load_kube_config()
-        _RefreshingK8sClient._api = client.CoreV1Api()
-        _RefreshingK8sClient._created_at = time.monotonic()
-        logger.debug("Refreshed Kubernetes API client token")
-
-    def __getattr__(self, name: str) -> object:
-        with self._lock:
-            if self._api is None or time.monotonic() - self._created_at > _TOKEN_REFRESH_INTERVAL:
-                self._refresh()
-            return getattr(self._api, name)
-
-
-_kubeconfig_lock = threading.Lock()
-_kubeconfig_updated = False
-
-
-def create_k8s_client(config: AWSConfig) -> _RefreshingK8sClient:
-    """Create a Kubernetes CoreV1Api client configured for the EKS cluster.
-
-    Always updates kubeconfig on first call (idempotent, ensures correct
-    account context). Returns a proxy that auto-refreshes the EKS token.
-    """
-    global _kubeconfig_updated
+    global _kubeconfig_setup
 
     with _kubeconfig_lock:
-        if not _kubeconfig_updated:
+        if not _kubeconfig_setup:
             cmd = [
                 "aws", "eks", "update-kubeconfig",
                 "--name", config.eks_cluster_name,
@@ -97,12 +83,10 @@ def create_k8s_client(config: AWSConfig) -> _RefreshingK8sClient:
                 cmd += ["--profile", config.profile_name]
 
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            _kubeconfig_updated = True
+            _kubeconfig_setup = True
 
-    client = _RefreshingK8sClient()
-    # Force an initial token load
-    client.api_client  # noqa: B018
-    return client
+    ensure_fresh_kubeconfig()
+    return client.CoreV1Api()
 
 
 async def load_config_from_stack(

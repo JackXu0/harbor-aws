@@ -11,26 +11,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import shlex
 import time
 
-from kubernetes import client, config as k8s_config
+from kubernetes import client
 from kubernetes.stream import stream
 
 logger = logging.getLogger(__name__)
 
 # Retry config for transient WebSocket handshake failures (e.g. "Handshake status 200 OK")
-_EXEC_MAX_RETRIES = 5
-_EXEC_RETRY_BASE_DELAY = 2.0
+_EXEC_MAX_RETRIES = 10
+_EXEC_RETRY_BASE_DELAY = 1.0
+
 
 
 def _make_isolated_api() -> client.CoreV1Api:
-    """Create a fresh CoreV1Api with its own ApiClient.
+    """Create a fresh CoreV1Api with its own ApiClient and a fresh token.
 
     This prevents stream()'s monkey-patching of api_client.request from
     affecting concurrent REST calls on the shared client.
-    Uses the current default configuration (set by load_kube_config).
     """
+    from harbor_aws.core.config import ensure_fresh_kubeconfig
+
+    ensure_fresh_kubeconfig()
     return client.CoreV1Api(api_client=client.ApiClient())
 
 
@@ -186,17 +190,12 @@ async def exec_command(
                     "timed out",
                 ))
                 if is_transient and attempt < _EXEC_MAX_RETRIES - 1:
-                    delay = _EXEC_RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = _EXEC_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 2)
                     logger.warning(
                         "Exec failed for %s (attempt %d/%d, %s), retrying in %.1fs: %s",
                         pod_name, attempt + 1, _EXEC_MAX_RETRIES,
                         type(e).__name__, delay, err_str[:120],
                     )
-                    # Refresh kubeconfig on auth/connection errors
-                    try:
-                        k8s_config.load_kube_config()
-                    except Exception:
-                        pass
                     time.sleep(delay)
                     continue
                 if "Handshake status" in err_str:
