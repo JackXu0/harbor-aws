@@ -100,49 +100,13 @@ class HarborAWSStack(cdk.Stack):
                 iam.Role.from_role_arn(self, "ClusterAdminRole", cluster_admin_role_arn)
             )
 
-        # Grant ECR pull-through cache permissions to Fargate pod execution roles.
-        # Without these, first-pull cache misses fail because the role can't
-        # create ECR repos or import upstream images on behalf of the pod.
-        for child in cluster.node.children:
-            if hasattr(child, "pod_execution_role"):
-                child.pod_execution_role.add_to_principal_policy(
-                    iam.PolicyStatement(
-                        sid="ECRPullThroughCache",
-                        actions=["ecr:CreateRepository", "ecr:BatchImportUpstreamImage"],
-                        resources=[f"arn:aws:ecr:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:repository/docker-hub/*"],
-                    )
-                )
-
-        # Patch CoreDNS to run on Fargate (remove ec2 compute-type annotation)
-        eks.KubernetesPatch(
-            self,
-            "CoreDnsFargatePatch",
-            cluster=cluster,
-            resource_name="deployment/coredns",
-            resource_namespace="kube-system",
-            apply_patch={
-                "spec": {
-                    "template": {
-                        "metadata": {
-                            "annotations": {
-                                "eks.amazonaws.com/compute-type": "fargate",
-                            },
-                        },
-                    },
-                },
-            },
-            restore_patch={
-                "spec": {
-                    "template": {
-                        "metadata": {
-                            "annotations": {
-                                "eks.amazonaws.com/compute-type": "ec2",
-                            },
-                        },
-                    },
-                },
-            },
-            patch_type=eks.PatchType.STRATEGIC,
+        # Grant ECR pull-through cache permissions to Fargate pod execution role.
+        cluster.default_profile.pod_execution_role.add_to_principal_policy(
+            iam.PolicyStatement(
+                sid="ECRPullThroughCache",
+                actions=["ecr:CreateRepository", "ecr:BatchImportUpstreamImage"],
+                resources=[f"arn:aws:ecr:{cdk.Aws.REGION}:{cdk.Aws.ACCOUNT_ID}:repository/docker-hub/*"],
+            )
         )
 
         # ============================================================
