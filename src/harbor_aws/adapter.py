@@ -165,11 +165,20 @@ class AWSEnvironment(BaseEnvironment):
     _docker_secret_name: str | None = None
 
     # Limit concurrent image pulls to avoid Docker Hub rate limits.
-    # Only this many pods will be in the create+pull phase at a time;
-    # once a pod is Running the slot is released for the next one.
-    # With ECR cache there are no Docker Hub rate limits, so the limit is high.
     _image_pull_semaphore: asyncio.Semaphore | None = None
     _image_pull_semaphore_size: int = 0
+
+    # Limit concurrent exec calls during pod setup to avoid overwhelming the
+    # EKS API server. At 1000+ pods, simultaneous WebSocket handshakes cause
+    # 500 Internal Server Errors. This only applies to setup; long-running
+    # agent exec calls are not throttled.
+    _setup_semaphore: asyncio.Semaphore | None = None
+
+    @classmethod
+    def _get_setup_semaphore(cls) -> asyncio.Semaphore:
+        if cls._setup_semaphore is None:
+            cls._setup_semaphore = asyncio.Semaphore(500)
+        return cls._setup_semaphore
 
     @classmethod
     def _get_pull_semaphore(cls, ecr_cache: bool = False) -> asyncio.Semaphore:
@@ -348,41 +357,44 @@ class AWSEnvironment(BaseEnvironment):
             raise
         self.logger.debug("[start] pod running: %s", self._pod_name)
 
-        # Run Dockerfile RUN/WORKDIR commands if image was extracted from Dockerfile
-        for i, cmd in enumerate(dockerfile_commands):
-            self.logger.debug("[start] running Dockerfile command %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
+        # Throttle setup exec calls to avoid overwhelming the EKS API server.
+        # Long-running agent exec (via self.exec()) is NOT throttled.
+        async with self._get_setup_semaphore():
+            # Run Dockerfile RUN/WORKDIR commands if image was extracted from Dockerfile
+            for i, cmd in enumerate(dockerfile_commands):
+                self.logger.debug("[start] running Dockerfile command %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
+                try:
+                    result = await self.exec(cmd, timeout_sec=300)
+                except Exception as e:
+                    self.logger.error("[start] Dockerfile cmd %d FAILED for %s: %s: %s", i + 1, self._pod_name, type(e).__name__, str(e)[:200])
+                    raise
+                if result.return_code != 0:
+                    self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
+
+            # Create required log directories
+            self.logger.debug("[start] creating log dirs in pod %s", self._pod_name)
             try:
-                result = await self.exec(cmd, timeout_sec=300)
+                mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
             except Exception as e:
-                self.logger.error("[start] Dockerfile cmd %d FAILED for %s: %s: %s", i + 1, self._pod_name, type(e).__name__, str(e)[:200])
+                self.logger.error("[start] mkdir FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
                 raise
-            if result.return_code != 0:
-                self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
+            if mkdir_result.return_code != 0:
+                raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
 
-        # Create required log directories
-        self.logger.debug("[start] creating log dirs in pod %s", self._pod_name)
-        try:
-            mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
-        except Exception as e:
-            self.logger.error("[start] mkdir FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
-            raise
-        if mkdir_result.return_code != 0:
-            raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
-
-        # Install 'script' command if missing — terminus-2 requires it for tmux sessions.
-        # Some SWE-bench Pro images (Go, JS repos) don't include bsdutils.
-        check = await self.exec("command -v script")
-        if check.return_code != 0:
-            self.logger.debug("[start] installing bsdutils (script) in pod %s", self._pod_name)
-            install = await self.exec(
-                "apt-get update -qq && apt-get install -y -qq bsdutils 2>/dev/null"
-                " || apk add --no-cache util-linux 2>/dev/null"
-                " || yum install -y util-linux 2>/dev/null"
-                " || true",
-                timeout_sec=120,
-            )
-            if install.return_code != 0:
-                self.logger.warning("[start] bsdutils install may have failed (rc=%d) in %s", install.return_code, self._pod_name)
+            # Install 'script' command if missing — terminus-2 requires it for tmux sessions.
+            # Some SWE-bench Pro images (Go, JS repos) don't include bsdutils.
+            check = await self.exec("command -v script")
+            if check.return_code != 0:
+                self.logger.debug("[start] installing bsdutils (script) in pod %s", self._pod_name)
+                install = await self.exec(
+                    "apt-get update -qq && apt-get install -y -qq bsdutils 2>/dev/null"
+                    " || apk add --no-cache util-linux 2>/dev/null"
+                    " || yum install -y util-linux 2>/dev/null"
+                    " || true",
+                    timeout_sec=120,
+                )
+                if install.return_code != 0:
+                    self.logger.warning("[start] bsdutils install may have failed (rc=%d) in %s", install.return_code, self._pod_name)
 
         self.logger.debug("[start] pod %s fully ready", self._pod_name)
 
