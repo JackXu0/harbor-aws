@@ -42,6 +42,7 @@ class AWSConfig:
     # EKS
     eks_cluster_name: str = "harbor-aws"
     namespace: str = "harbor"
+    service_account_name: str = "harbor-pod"
 
     # AWS account (needed for ECR pull-through cache URI)
     account_id: str | None = None
