@@ -58,7 +58,7 @@ class AWSConfig:
         if not self.eks_cluster_name:
             raise ValueError(
                 "Missing required AWS config field: eks_cluster_name. "
-                "Set it directly or use stack_name to read from CloudFormation outputs."
+                "Use stack_name to read from CloudFormation outputs."
             )
 
 

@@ -20,10 +20,8 @@ from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_fro
 
 # Fargate resource profiles for known benchmark images.
 # Matched top-to-bottom by regex against the docker image URI.
-# If no pattern matches, the benchmark's own defaults are used.
 _RESOURCE_PROFILES: list[tuple[str, int, int]] = [
     # (image_pattern,  cpus,  memory_mb)
-    # SWE-bench — Go/JS repos need extra CPU for dependency compilation
     (r"swebench/sweb\.eval", 2, 8192),
 ]
 
@@ -37,15 +35,20 @@ def _match_resource_profile(image: str) -> tuple[int, int] | None:
 
 
 class AWSEnvironment(BaseEnvironment):
-    """AWS EKS/Fargate implementation for Harbor sandboxes.
+    """AWS EKS/Fargate sandbox for Harbor benchmarks.
 
-    Runs each sandbox as a Kubernetes pod on EKS Fargate. Commands are executed
-    via `kubectl exec` (WebSocket). File transfer uses `kubectl cp`.
-
-    Configuration can be provided either:
-    1. Directly via kwargs (eks_cluster_name, namespace, etc.)
-    2. Via stack_name to auto-read from CloudFormation stack outputs
+    Each sandbox runs as a Kubernetes pod on EKS Fargate. Commands execute via
+    WebSocket exec; files transfer via tar-over-exec.
     """
+
+    # -- Class-level shared state (avoid repeated API calls across instances) --
+    _cached_stack_config: AWSConfig | None = None
+    _shared_k8s_api = None
+    _docker_secret_checked = False
+    _docker_secret_name: str | None = None
+    _image_pull_semaphore: asyncio.Semaphore | None = None
+    _image_pull_semaphore_size: int = 0
+    _setup_semaphore: asyncio.Semaphore | None = None
 
     def __init__(
         self,
@@ -54,12 +57,10 @@ class AWSEnvironment(BaseEnvironment):
         session_id: str,
         trial_paths: TrialPaths,
         task_env_config: EnvironmentConfig,
-        # AWS-specific kwargs (passed via --environment-kwarg)
+        *,
         region: str = "us-east-1",
         profile_name: str | None = None,
         stack_name: str = "harbor-aws",
-        eks_cluster_name: str = "harbor-aws",
-        namespace: str = "harbor",
         service_account_name: str = "harbor-pod",
         ecr_cache: bool = False,
         cpus: int | None = None,
@@ -81,19 +82,17 @@ class AWSEnvironment(BaseEnvironment):
             region=region,
             profile_name=profile_name,
             stack_name=stack_name,
-            eks_cluster_name=eks_cluster_name,
-            namespace=namespace,
             service_account_name=service_account_name,
             ecr_cache=ecr_cache,
         )
 
-        # Optional resource overrides (override benchmark defaults)
         self._cpus_override = int(cpus) if cpus is not None else None
         self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
-        self._config_loaded = bool(eks_cluster_name and eks_cluster_name != "harbor-aws" and not stack_name)
+
+    # -- Properties --------------------------------------------------------
 
     @staticmethod
     def type() -> EnvironmentType:
@@ -112,37 +111,32 @@ class AWSEnvironment(BaseEnvironment):
         return True
 
     def _validate_definition(self) -> None:
-        pass  # prebuilt images only
+        pass
+
+    # -- Initialization helpers --------------------------------------------
 
     async def _ensure_config(self) -> None:
-        """Load config from CloudFormation stack if stack_name was provided."""
-        if self._config_loaded:
-            return
-
-        if self._aws_config.stack_name:
-            # Cache stack config at class level to avoid repeated CloudFormation calls
-            # (which fail if AWS credentials expire mid-run)
-            if AWSEnvironment._cached_stack_config is not None:
-                self._aws_config = AWSEnvironment._cached_stack_config
-            else:
-                self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
-                ecr_cache = self._aws_config.ecr_cache
-                sa_name = self._aws_config.service_account_name
-                self._aws_config = await load_config_from_stack(
-                    stack_name=self._aws_config.stack_name,
-                    region=self._aws_config.region,
-                    profile_name=self._aws_config.profile_name,
-                )
-                self._aws_config.ecr_cache = ecr_cache
-                self._aws_config.service_account_name = sa_name
-                AWSEnvironment._cached_stack_config = self._aws_config
+        """Load cluster config from CloudFormation and resolve account_id."""
+        if AWSEnvironment._cached_stack_config is not None:
+            self._aws_config = AWSEnvironment._cached_stack_config
         else:
-            self._aws_config.validate()
+            self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
+            ecr_cache = self._aws_config.ecr_cache
+            sa_name = self._aws_config.service_account_name
+            self._aws_config = await load_config_from_stack(
+                stack_name=self._aws_config.stack_name,
+                region=self._aws_config.region,
+                profile_name=self._aws_config.profile_name,
+            )
+            self._aws_config.ecr_cache = ecr_cache
+            self._aws_config.service_account_name = sa_name
+            AWSEnvironment._cached_stack_config = self._aws_config
 
-        # Resolve account_id for ECR pull-through cache if enabled
+        # Resolve account_id for ECR pull-through cache if not already set.
         if self._aws_config.ecr_cache and not self._aws_config.account_id:
             try:
                 import boto3
+
                 session = boto3.Session(
                     profile_name=self._aws_config.profile_name,
                     region_name=self._aws_config.region,
@@ -153,30 +147,12 @@ class AWSEnvironment(BaseEnvironment):
             except Exception as e:
                 self.logger.warning("Could not resolve AWS account ID for ECR cache: %s", e)
 
-        self._config_loaded = True
-
-    _shared_k8s_api = None
-
     def _ensure_k8s_client(self) -> None:
         """Initialize Kubernetes API client (shared across instances)."""
         if self._k8s_api is None:
             if AWSEnvironment._shared_k8s_api is None:
                 AWSEnvironment._shared_k8s_api = create_k8s_client(self._aws_config)
             self._k8s_api = AWSEnvironment._shared_k8s_api
-
-    _cached_stack_config: AWSConfig | None = None
-    _docker_secret_checked = False
-    _docker_secret_name: str | None = None
-
-    # Limit concurrent image pulls to avoid Docker Hub rate limits.
-    _image_pull_semaphore: asyncio.Semaphore | None = None
-    _image_pull_semaphore_size: int = 0
-
-    # Limit concurrent exec calls during pod setup to avoid overwhelming the
-    # EKS API server. At 1000+ pods, simultaneous WebSocket handshakes cause
-    # 500 Internal Server Errors. This only applies to setup; long-running
-    # agent exec calls are not throttled.
-    _setup_semaphore: asyncio.Semaphore | None = None
 
     @classmethod
     def _get_setup_semaphore(cls) -> asyncio.Semaphore:
@@ -192,6 +168,8 @@ class AWSEnvironment(BaseEnvironment):
             cls._image_pull_semaphore_size = limit
         return cls._image_pull_semaphore
 
+    # -- Docker Hub credentials --------------------------------------------
+
     async def _ensure_docker_pull_secret(self) -> None:
         """Create imagePullSecret from ~/.docker/config.json if not already present."""
         if AWSEnvironment._docker_secret_checked:
@@ -203,7 +181,6 @@ class AWSEnvironment(BaseEnvironment):
             AWSEnvironment._docker_secret_checked = True
             return
 
-        # Check if Docker Hub auth is actually configured
         try:
             cfg_data = json.loads(docker_cfg.read_text())
             has_dockerhub = any(
@@ -237,30 +214,28 @@ class AWSEnvironment(BaseEnvironment):
                     namespace=self._aws_config.namespace,
                     body=secret,
                 )
-                self.logger.debug("Created %s secret from ~/.docker/config.json", secret_name)
+                self.logger.debug("Created %s secret", secret_name)
             except client.ApiException as create_err:
-                if create_err.status != 409:  # 409 Conflict = already exists (race condition)
+                if create_err.status != 409:
                     raise
 
         AWSEnvironment._docker_secret_name = secret_name
         AWSEnvironment._docker_secret_checked = True
 
+    # -- Image helpers -----------------------------------------------------
+
     def _ecr_image_uri(self, image: str) -> str:
-        """Rewrite a Docker Hub image URI to use the ECR pull-through cache.
+        """Rewrite a Docker Hub image to use the ECR pull-through cache.
 
-        docker.io/library/ubuntu:22.04  →  …/docker-hub/library/ubuntu:22.04
-        swebench/sweb.eval.x86_64:latest →  …/docker-hub/swebench/sweb.eval.x86_64:latest
+        ``alexgshaw/foo:tag`` → ``<account>.dkr.ecr.<region>.amazonaws.com/docker-hub/alexgshaw/foo:tag``
 
-        Images already pointing at ECR or other registries are returned unchanged.
+        Non-Docker-Hub images are returned unchanged.
         """
-        # Strip explicit docker.io prefix if present
         stripped = re.sub(r"^(docker\.io|registry-1\.docker\.io)/", "", image)
 
-        # Already an ECR or other registry URI — leave unchanged
         if re.match(r"^[\w.-]+\.amazonaws\.com/", stripped) or re.match(r"^[\w.-]+\.\w{2,}/", stripped):
             return image
 
-        # Docker Hub official images have no namespace — add "library/"
         if "/" not in stripped.split(":")[0]:
             stripped = f"library/{stripped}"
 
@@ -268,17 +243,13 @@ class AWSEnvironment(BaseEnvironment):
         region = self._aws_config.region
 
         if not account:
-            self.logger.debug("No account_id available, skipping ECR rewrite for %s", image)
+            self.logger.debug("No account_id, skipping ECR rewrite for %s", image)
             return image
 
         return f"{account}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
 
     def _parse_dockerfile(self) -> tuple[str | None, list[str]]:
-        """Parse Dockerfile to extract base image and RUN/WORKDIR commands.
-
-        Returns (image, setup_commands) where setup_commands are shell commands
-        to run after pod creation to replicate RUN and WORKDIR instructions.
-        """
+        """Extract base image and RUN/WORKDIR commands from Dockerfile."""
         dockerfile = self.environment_dir / "Dockerfile"
         if not dockerfile.exists():
             return None, []
@@ -288,7 +259,6 @@ class AWSEnvironment(BaseEnvironment):
 
         for line in dockerfile.read_text().splitlines():
             stripped = line.strip()
-            # Skip comments and empty lines
             if not stripped or stripped.startswith("#"):
                 continue
             if stripped.upper().startswith("FROM ") and image is None:
@@ -300,6 +270,8 @@ class AWSEnvironment(BaseEnvironment):
                 commands.append(f"mkdir -p {path} && cd {path}")
 
         return image, commands
+
+    # -- Lifecycle ---------------------------------------------------------
 
     async def start(self, force_build: bool) -> None:
         """Start a Kubernetes pod for the benchmark task."""
@@ -316,19 +288,16 @@ class AWSEnvironment(BaseEnvironment):
                 "No docker_image specified and no Dockerfile found. "
                 "harbor-aws only supports prebuilt images."
             )
-        # Rewrite Docker Hub images to use ECR pull-through cache (opt-in)
+
         if self._aws_config.ecr_cache:
             image_uri = self._ecr_image_uri(image_uri)
         self.logger.debug("Using image: %s", image_uri)
 
-        # Resource priority: explicit override > image profile > benchmark default
         profile = _match_resource_profile(image_uri)
         pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
         pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
 
-        # Limit concurrent image pulls.  With ECR cache: 500 (no rate limits).
-        # Without: 50 (Docker Hub rate limits).  The semaphore is released once
-        # the image is pulled, so Fargate scheduling doesn't block other pods.
+        # Limit concurrent image pulls (ECR: 500, Docker Hub: 50).
         async with self._get_pull_semaphore(self._aws_config.ecr_cache):
             self.logger.debug("[start] creating pod for %s", self.environment_name)
             self._pod_name = await pods.create_pod(
@@ -349,7 +318,6 @@ class AWSEnvironment(BaseEnvironment):
                 self._pod_name,
             )
 
-        # Wait for the pod to be fully running (outside the semaphore)
         try:
             await pods.wait_for_pod_running(
                 self._k8s_api,
@@ -361,12 +329,10 @@ class AWSEnvironment(BaseEnvironment):
             raise
         self.logger.debug("[start] pod running: %s", self._pod_name)
 
-        # Throttle setup exec calls to avoid overwhelming the EKS API server.
-        # Long-running agent exec (via self.exec()) is NOT throttled.
+        # Throttle setup exec calls to avoid overwhelming the API server.
         async with self._get_setup_semaphore():
-            # Run Dockerfile RUN/WORKDIR commands if image was extracted from Dockerfile
             for i, cmd in enumerate(dockerfile_commands):
-                self.logger.debug("[start] running Dockerfile command %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
+                self.logger.debug("[start] Dockerfile cmd %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
                 try:
                     result = await self.exec(cmd, timeout_sec=300)
                 except Exception as e:
@@ -375,7 +341,6 @@ class AWSEnvironment(BaseEnvironment):
                 if result.return_code != 0:
                     self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
 
-            # Create required log directories
             self.logger.debug("[start] creating log dirs in pod %s", self._pod_name)
             try:
                 mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
@@ -385,11 +350,10 @@ class AWSEnvironment(BaseEnvironment):
             if mkdir_result.return_code != 0:
                 raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
 
-            # Install 'script' command if missing — terminus-2 requires it for tmux sessions.
-            # Some SWE-bench Pro images (Go, JS repos) don't include bsdutils.
+            # Install 'script' if missing — needed for tmux sessions in some benchmarks.
             check = await self.exec("command -v script")
             if check.return_code != 0:
-                self.logger.debug("[start] installing bsdutils (script) in pod %s", self._pod_name)
+                self.logger.debug("[start] installing bsdutils in pod %s", self._pod_name)
                 install = await self.exec(
                     "apt-get update -qq && apt-get install -y -qq bsdutils 2>/dev/null"
                     " || apk add --no-cache util-linux 2>/dev/null"
@@ -406,11 +370,7 @@ class AWSEnvironment(BaseEnvironment):
         """Delete the pod."""
         try:
             if self._pod_name and self._k8s_api:
-                await pods.delete_pod(
-                    self._k8s_api,
-                    self._aws_config,
-                    self._pod_name,
-                )
+                await pods.delete_pod(self._k8s_api, self._aws_config, self._pod_name)
         except Exception as e:
             self.logger.warning("Error deleting pod: %s", e)
         finally:
@@ -438,28 +398,16 @@ class AWSEnvironment(BaseEnvironment):
             timeout_sec=timeout_sec,
         )
 
-        return ExecResult(
-            stdout=stdout,
-            stderr=stderr,
-            return_code=return_code,
-        )
+        return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await files.upload_file(
-            self._pod_name, self._aws_config.namespace, str(source_path), target_path,
-        )
+        await files.upload_file(self._pod_name, self._aws_config.namespace, str(source_path), target_path)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await files.upload_dir(
-            self._pod_name, self._aws_config.namespace, str(source_dir), target_dir,
-        )
+        await files.upload_dir(self._pod_name, self._aws_config.namespace, str(source_dir), target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        await files.download_file(
-            self._pod_name, self._aws_config.namespace, source_path, str(target_path),
-        )
+        await files.download_file(self._pod_name, self._aws_config.namespace, source_path, str(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        await files.download_dir(
-            self._pod_name, self._aws_config.namespace, source_dir, str(target_dir),
-        )
+        await files.download_dir(self._pod_name, self._aws_config.namespace, source_dir, str(target_dir))
