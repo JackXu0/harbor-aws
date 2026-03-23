@@ -1,4 +1,4 @@
-"""File transfer via tar-over-exec (same mechanism as kubectl cp)."""
+"""Upload/download files between the orchestrator and pods via tar-over-exec."""
 
 from __future__ import annotations
 
@@ -13,9 +13,18 @@ from pathlib import Path
 from kubernetes import client
 from kubernetes.stream import stream
 
-from harbor_aws.core.exec import _make_isolated_api
+from tenacity import retry, retry_if_exception_message, stop_after_attempt, wait_exponential_jitter
+
+from harbor_aws.core.exec import _TRANSIENT_ERRORS, _make_isolated_api
 
 logger = logging.getLogger(__name__)
+
+_retry_transient = retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
+    retry=retry_if_exception_message(match="|".join(_TRANSIENT_ERRORS)),
+    reraise=True,
+)
 
 _TRANSFER_CONCURRENCY = 100
 _transfer_semaphore: asyncio.Semaphore | None = None
@@ -109,6 +118,7 @@ def _create_tar(entries: dict[str, str]) -> bytes:
     return buf.getvalue()
 
 
+@_retry_transient
 def _exec_tar_upload(
     pod_name: str, namespace: str, container: str, target_dir: str, tar_data: bytes,
 ) -> None:
@@ -130,6 +140,7 @@ def _exec_tar_upload(
         logger.debug("tar upload stderr for %s: %s", pod_name, stderr[:200])
 
 
+@_retry_transient
 def _exec_tar_download(pod_name: str, namespace: str, container: str, tar_cmd: str) -> bytes:
     """Run a tar|base64 command in a pod and return decoded bytes.
 
