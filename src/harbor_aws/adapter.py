@@ -59,7 +59,7 @@ class AWSEnvironment(BaseEnvironment):
         task_env_config: EnvironmentConfig,
         *,
         region: str = "us-east-1",
-        profile_name: str | None = None,
+        role_arn: str | None = None,
         stack_name: str = "harbor-aws",
         bedrock: bool = False,
         ecr_cache: bool = False,
@@ -80,7 +80,7 @@ class AWSEnvironment(BaseEnvironment):
 
         self._aws_config = AWSConfig(
             region=region,
-            profile_name=profile_name,
+            role_arn=role_arn,
             stack_name=stack_name,
             ecr_cache=ecr_cache,
         )
@@ -125,7 +125,7 @@ class AWSEnvironment(BaseEnvironment):
             self._aws_config = await load_config_from_stack(
                 stack_name=self._aws_config.stack_name,
                 region=self._aws_config.region,
-                profile_name=self._aws_config.profile_name,
+                role_arn=self._aws_config.role_arn,
             )
             self._aws_config.ecr_cache = ecr_cache
             AWSEnvironment._cached_stack_config = self._aws_config
@@ -138,12 +138,7 @@ class AWSEnvironment(BaseEnvironment):
         # Resolve account_id for ECR pull-through cache if not already set.
         if self._aws_config.ecr_cache and not self._aws_config.account_id:
             try:
-                import boto3
-
-                session = boto3.Session(
-                    profile_name=self._aws_config.profile_name,
-                    region_name=self._aws_config.region,
-                )
+                session = self._aws_config.create_boto3_session()
                 self._aws_config.account_id = await asyncio.to_thread(
                     lambda: session.client("sts").get_caller_identity()["Account"]
                 )

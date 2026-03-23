@@ -37,7 +37,7 @@ class AWSConfig:
 
     # AWS credentials
     region: str = "us-east-1"
-    profile_name: str | None = None
+    role_arn: str | None = None  # Set for cross-account; None for same account
 
     # EKS
     eks_cluster_name: str = "harbor-aws"
@@ -50,7 +50,7 @@ class AWSConfig:
     # ECR pull-through cache (opt-in, requires setup — see README)
     ecr_cache: bool = False
 
-    # Stack-based configuration (alternative to individual fields)
+    # Stack-based configuration
     stack_name: str | None = None
 
     def validate(self) -> None:
@@ -60,6 +60,19 @@ class AWSConfig:
                 "Missing required AWS config field: eks_cluster_name. "
                 "Use stack_name to read from CloudFormation outputs."
             )
+
+    def create_boto3_session(self) -> boto3.Session:
+        """Create a boto3 session, assuming role_arn if provided (cross-account)."""
+        if self.role_arn:
+            sts = boto3.client("sts", region_name=self.region)
+            creds = sts.assume_role(RoleArn=self.role_arn, RoleSessionName="harbor-aws")["Credentials"]
+            return boto3.Session(
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+                region_name=self.region,
+            )
+        return boto3.Session(region_name=self.region)
 
 
 _kubeconfig_setup = False
@@ -80,8 +93,8 @@ def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
                 "--name", config.eks_cluster_name,
                 "--region", config.region,
             ]
-            if config.profile_name:
-                cmd += ["--profile", config.profile_name]
+            if config.role_arn:
+                cmd += ["--role-arn", config.role_arn]
 
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             _kubeconfig_setup = True
@@ -93,12 +106,14 @@ def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
 async def load_config_from_stack(
     stack_name: str,
     region: str = "us-east-1",
-    profile_name: str | None = None,
+    role_arn: str | None = None,
 ) -> AWSConfig:
     """Load AWSConfig from CloudFormation stack outputs."""
 
+    tmp = AWSConfig(region=region, role_arn=role_arn)
+
     def _read_outputs() -> tuple[dict[str, str], str]:
-        session = boto3.Session(profile_name=profile_name, region_name=region)
+        session = tmp.create_boto3_session()
         cfn = session.client("cloudformation")
         response = cfn.describe_stacks(StackName=stack_name)
 
@@ -122,7 +137,7 @@ async def load_config_from_stack(
 
     config = AWSConfig(
         region=region,
-        profile_name=profile_name,
+        role_arn=role_arn,
         stack_name=stack_name,
         eks_cluster_name=outputs.get("EksClusterName", "harbor-aws"),
         namespace=outputs.get("Namespace", "harbor"),
