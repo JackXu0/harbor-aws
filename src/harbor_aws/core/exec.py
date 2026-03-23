@@ -60,65 +60,6 @@ def _build_full_command(
     return " ".join(parts)
 
 
-def _apply_sweagent_patches(command: str) -> str:
-    """Apply swe-agent command patches that are needed regardless of model."""
-    # Make conda sourcing conditional (file may not exist)
-    command = command.replace(
-        ". /etc/profile.d/testbed-conda.sh",
-        "if [ -f /etc/profile.d/testbed-conda.sh ]; then . /etc/profile.d/testbed-conda.sh; fi",
-    )
-
-    # Fix repo path: $(pwd) isn't expanded inside single quotes, so switch to preexisting repo mode
-    command = command.replace(
-        "echo '--env.repo.path=$(pwd)'",
-        "echo \"--env.repo.type=preexisting --env.repo.repo_name=$(pwd)\"",
-    )
-
-    # Set up git identity and init repo if needed (for preexisting repos like /testbed or /app)
-    if "sweagent run" in command and "--env.repo.repo_name=" in command:
-        git_setup = (
-            "export GIT_AUTHOR_NAME='harbor' GIT_AUTHOR_EMAIL='harbor@local'"
-            " GIT_COMMITTER_NAME='harbor' GIT_COMMITTER_EMAIL='harbor@local';"
-            " git config --global user.email 'harbor@local' 2>/dev/null || true;"
-            " git config --global user.name 'harbor' 2>/dev/null || true;"
-            " if ! git rev-parse --git-dir > /dev/null 2>&1; then"
-            " git init -q . && touch .gitkeep && git add -A && git commit -q -m init;"
-            " fi; "
-        )
-        command = git_setup + command
-
-    return command
-
-
-def _apply_bedrock_non_anthropic_patches(command: str) -> str:
-    """Apply patches for non-Anthropic models on Bedrock.
-
-    These handle:
-    - Installing boto3 (required by litellm for Bedrock auth)
-    - Upgrading litellm (older versions don't route to Converse API correctly)
-    - Removing prompt caching config (only Anthropic models support cache_control)
-    """
-    if "sweagent run" not in command:
-        return command
-
-    command = command.replace(
-        "sweagent run ",
-        "(. $HOME/.local/bin/env 2>/dev/null;"
-        " uv pip install -q boto3 litellm --upgrade --python /opt/sweagent-venv/bin/python"
-        ") 2>/dev/null || true;"
-        " sed -i 's/^  history_processors:$/  history_processors: []/; /- type: cache_control/d; /last_n_messages:/d'"
-        " /opt/sweagent-configs/default.yaml 2>/dev/null || true;"
-        " sweagent run ",
-    )
-
-    return command
-
-
-def _is_anthropic_model(command: str) -> bool:
-    """Check if the command uses an Anthropic model."""
-    return "anthropic" in command or "claude" in command
-
-
 async def exec_command(
     api: client.CoreV1Api,
     pod_name: str,
@@ -135,10 +76,6 @@ async def exec_command(
         Tuple of (stdout, stderr, return_code).
     """
     full_command = _build_full_command(command, cwd, env)
-    full_command = _apply_sweagent_patches(full_command)
-
-    if not _is_anthropic_model(full_command):
-        full_command = _apply_bedrock_non_anthropic_patches(full_command)
 
     # Wrap command to capture exit code reliably
     wrapped = f"bash -lc {shlex.quote(full_command)}; echo \":::HARBOR_RC:::$?\""
