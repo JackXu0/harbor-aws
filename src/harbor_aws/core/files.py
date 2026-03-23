@@ -82,13 +82,7 @@ async def download_file(
         tar_data = await asyncio.to_thread(_exec_tar_download, pod_name, namespace, container, tar_cmd)
 
     with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r:*") as tar:
-        members = tar.getmembers()
-        if not members:
-            raise RuntimeError(f"No file found at {source_path} in pod {pod_name}")
-        extracted = tar.extractfile(members[0])
-        if extracted is None:
-            raise RuntimeError(f"Could not extract {source_path} from pod {pod_name}")
-        Path(target_path).write_bytes(extracted.read())
+        Path(target_path).write_bytes(tar.extractfile(tar.getmembers()[0]).read())
 
 
 async def download_dir(
