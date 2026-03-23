@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -21,7 +22,7 @@ _kubeconfig_lock = threading.Lock()
 _kubeconfig_loaded_at: float = 0
 
 
-def ensure_fresh_kubeconfig() -> None:
+def _ensure_fresh_kubeconfig() -> None:
     """Reload kubeconfig if the EKS token is stale. Thread-safe."""
     global _kubeconfig_loaded_at
     with _kubeconfig_lock:
@@ -74,32 +75,36 @@ class AWSConfig:
             )
         return boto3.Session(region_name=self.region)
 
+    def _cli_env(self) -> dict[str, str] | None:
+        """Environment variables for running AWS CLI with cross-account credentials."""
+        if not self.role_arn:
+            return None
+        session = self.create_boto3_session()
+        creds = session.get_credentials().get_frozen_credentials()
+        env = {**os.environ, "AWS_ACCESS_KEY_ID": creds.access_key,
+               "AWS_SECRET_ACCESS_KEY": creds.secret_key}
+        if creds.token:
+            env["AWS_SESSION_TOKEN"] = creds.token
+        return env
+
 
 _kubeconfig_setup = False
 
 
 def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
-    """Create a Kubernetes CoreV1Api client for the EKS cluster.
-
-    First call runs 'aws eks update-kubeconfig'. Returns a standard CoreV1Api.
-    Call ensure_fresh_kubeconfig() before making API calls if tokens may be stale.
-    """
+    """Create a Kubernetes CoreV1Api client for the EKS cluster."""
     global _kubeconfig_setup
 
     with _kubeconfig_lock:
         if not _kubeconfig_setup:
-            cmd = [
-                "aws", "eks", "update-kubeconfig",
-                "--name", config.eks_cluster_name,
-                "--region", config.region,
-            ]
+            cmd = ["aws", "eks", "update-kubeconfig",
+                   "--name", config.eks_cluster_name, "--region", config.region]
             if config.role_arn:
                 cmd += ["--role-arn", config.role_arn]
-
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, env=config._cli_env())
             _kubeconfig_setup = True
 
-    ensure_fresh_kubeconfig()
+    _ensure_fresh_kubeconfig()
     return client.CoreV1Api()
 
 
