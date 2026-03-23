@@ -32,9 +32,9 @@ def _make_isolated_api() -> client.CoreV1Api:
     This prevents stream()'s monkey-patching of api_client.request from
     affecting concurrent REST calls on the shared client.
     """
-    from harbor_aws.core.config import ensure_fresh_kubeconfig
+    from harbor_aws.core.config import _ensure_fresh_kubeconfig
 
-    ensure_fresh_kubeconfig()
+    _ensure_fresh_kubeconfig()
     return client.CoreV1Api(api_client=client.ApiClient())
 
 
