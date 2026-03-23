@@ -22,7 +22,7 @@ _kubeconfig_lock = threading.Lock()
 _kubeconfig_loaded_at: float = 0
 
 
-def _ensure_fresh_kubeconfig() -> None:
+def ensure_fresh_kubeconfig() -> None:
     """Reload kubeconfig if the EKS token is stale. Thread-safe."""
     global _kubeconfig_loaded_at
     with _kubeconfig_lock:
@@ -104,7 +104,7 @@ def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
             subprocess.run(cmd, check=True, capture_output=True, text=True, env=config._cli_env())
             _kubeconfig_setup = True
 
-    _ensure_fresh_kubeconfig()
+    ensure_fresh_kubeconfig()
     return client.CoreV1Api()
 
 
