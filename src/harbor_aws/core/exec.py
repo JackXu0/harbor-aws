@@ -1,37 +1,25 @@
-"""Command execution via Kubernetes exec (WebSocket).
-
-IMPORTANT: The kubernetes `stream()` function monkey-patches `api_client.request`
-with `websocket_call` during exec. If we share the same CoreV1Api between exec
-and REST calls, concurrent REST calls (e.g. read_namespaced_pod_status) get routed
-through WebSocket and fail. To avoid this, we create a fresh CoreV1Api for each
-stream() call.
-"""
+"""Command execution via Kubernetes WebSocket exec."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import shlex
-import time
 
 from kubernetes import client
 from kubernetes.stream import stream
+from tenacity import retry, retry_if_exception_message, stop_after_attempt, wait_exponential_jitter
 
 logger = logging.getLogger(__name__)
 
-# Retry config for transient WebSocket handshake failures (e.g. "Handshake status 200 OK")
-_EXEC_MAX_RETRIES = 10
-_EXEC_RETRY_BASE_DELAY = 1.0
+_TRANSIENT_ERRORS = ("Handshake status", "Unauthorized", "nodename nor servname",
+                     "Name or service not known", "Connection refused",
+                     "Connection reset", "timed out")
 
 
 
 def _make_isolated_api() -> client.CoreV1Api:
-    """Create a fresh CoreV1Api with its own ApiClient and a fresh token.
-
-    This prevents stream()'s monkey-patching of api_client.request from
-    affecting concurrent REST calls on the shared client.
-    """
+    """Return a CoreV1Api with its own ApiClient to avoid stream() thread-safety issues."""
     from harbor_aws.core.config import ensure_fresh_kubeconfig
 
     ensure_fresh_kubeconfig()
@@ -43,11 +31,8 @@ def _build_full_command(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
 ) -> str:
-    """Build the full command string with cwd and env var prefixes."""
+    """Build the full command string with cwd and env vars from Harbor."""
     parts = []
-
-    # Pre-set variables that third-party scripts may reference (avoids `set -u` failures)
-    parts.append("export CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-};")
 
     if env:
         for key, value in env.items():
@@ -82,68 +67,39 @@ async def exec_command(
 
     logger.debug("Exec in %s: %s", pod_name, command[:200])
 
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
+        retry=retry_if_exception_message(match="|".join(_TRANSIENT_ERRORS)),
+        reraise=True,
+        before_sleep=lambda rs: logger.warning(
+            "Exec %s attempt %d, retrying: %s", pod_name, rs.attempt_number, str(rs.outcome.exception())[:120]
+        ),
+    )
     def _exec() -> tuple[str | None, str | None, int]:
-        last_exc: Exception | None = None
-        for attempt in range(_EXEC_MAX_RETRIES):
-            try:
-                # Create an isolated CoreV1Api for this stream() call.
-                # stream() monkey-patches api_client.request with websocket_call;
-                # using a separate instance prevents this from breaking concurrent
-                # REST calls on the shared client.
-                exec_api = _make_isolated_api()
-                resp = stream(
-                    exec_api.connect_get_namespaced_pod_exec,
-                    name=pod_name,
-                    namespace=namespace,
-                    container=container,
-                    command=["bash", "-c", wrapped],
-                    stderr=True,
-                    stdout=True,
-                    stdin=False,
-                    tty=False,
-                    _preload_content=False,
-                )
+        exec_api = _make_isolated_api()
+        resp = stream(
+            exec_api.connect_get_namespaced_pod_exec,
+            name=pod_name,
+            namespace=namespace,
+            container=container,
+            command=["bash", "-c", wrapped],
+            stderr=True,
+            stdout=True,
+            stdin=False,
+            tty=False,
+            _preload_content=False,
+        )
 
-                resp.run_forever(timeout=timeout_sec or 300)
+        resp.run_forever(timeout=timeout_sec or 300)
 
-                stdout = resp.read_stdout() or ""
-                stderr = resp.read_stderr() or ""
+        stdout = resp.read_stdout() or ""
+        stderr = resp.read_stderr() or ""
 
-                # Parse return code from our sentinel
-                return_code = _parse_return_code(stdout)
-                stdout = _strip_return_code_sentinel(stdout)
+        return_code = _parse_return_code(stdout)
+        stdout = _strip_return_code_sentinel(stdout)
 
-                return (stdout or None, stderr or None, return_code)
-            except Exception as e:
-                last_exc = e
-                err_str = str(e)
-                is_transient = any(s in err_str for s in (
-                    "Handshake status",
-                    "Unauthorized",
-                    "nodename nor servname",  # DNS resolution failure
-                    "Name or service not known",  # DNS (Linux)
-                    "Connection refused",
-                    "Connection reset",
-                    "timed out",
-                ))
-                if is_transient and attempt < _EXEC_MAX_RETRIES - 1:
-                    delay = _EXEC_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 2)
-                    logger.warning(
-                        "Exec failed for %s (attempt %d/%d, %s), retrying in %.1fs: %s",
-                        pod_name, attempt + 1, _EXEC_MAX_RETRIES,
-                        type(e).__name__, delay, err_str[:120],
-                    )
-                    time.sleep(delay)
-                    continue
-                if "Handshake status" in err_str:
-                    logger.error(
-                        "WebSocket exec failed after %d attempts for %s. "
-                        "This usually means AWS credentials have expired. "
-                        "Run 'aws sso login' to refresh.",
-                        attempt + 1, pod_name,
-                    )
-                raise
-        raise last_exc  # type: ignore[misc]
+        return (stdout or None, stderr or None, return_code)
 
     return await asyncio.to_thread(_exec)
 
