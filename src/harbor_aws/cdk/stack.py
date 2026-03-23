@@ -263,3 +263,4 @@ class HarborAWSStack(cdk.Stack):
         cdk.CfnOutput(self, "EksClusterName", value=cluster.cluster_name)
         cdk.CfnOutput(self, "Namespace", value=namespace)
         cdk.CfnOutput(self, "Region", value=cdk.Aws.REGION)
+        cdk.CfnOutput(self, "PodServiceAccount", value=pod_sa.service_account_name)

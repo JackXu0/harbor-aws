@@ -61,7 +61,7 @@ class AWSEnvironment(BaseEnvironment):
         region: str = "us-east-1",
         profile_name: str | None = None,
         stack_name: str = "harbor-aws",
-        service_account_name: str = "harbor-pod",
+        bedrock: bool = False,
         ecr_cache: bool = False,
         cpus: int | None = None,
         memory_mb: int | None = None,
@@ -82,9 +82,9 @@ class AWSEnvironment(BaseEnvironment):
             region=region,
             profile_name=profile_name,
             stack_name=stack_name,
-            service_account_name=service_account_name,
             ecr_cache=ecr_cache,
         )
+        self._bedrock = bedrock
 
         self._cpus_override = int(cpus) if cpus is not None else None
         self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
@@ -122,15 +122,18 @@ class AWSEnvironment(BaseEnvironment):
         else:
             self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
             ecr_cache = self._aws_config.ecr_cache
-            sa_name = self._aws_config.service_account_name
             self._aws_config = await load_config_from_stack(
                 stack_name=self._aws_config.stack_name,
                 region=self._aws_config.region,
                 profile_name=self._aws_config.profile_name,
             )
             self._aws_config.ecr_cache = ecr_cache
-            self._aws_config.service_account_name = sa_name
             AWSEnvironment._cached_stack_config = self._aws_config
+
+        # Bedrock access requires a K8s service account with AWS credentials.
+        # The CDK stack creates one automatically (see cdk/stack.py).
+        if not self._bedrock:
+            self._aws_config.k8s_service_account = None
 
         # Resolve account_id for ECR pull-through cache if not already set.
         if self._aws_config.ecr_cache and not self._aws_config.account_id:

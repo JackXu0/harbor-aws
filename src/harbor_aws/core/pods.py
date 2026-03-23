@@ -67,7 +67,7 @@ async def create_pod(
                     ),
                 ),
             ],
-            service_account_name=config.service_account_name,
+            service_account_name=config.k8s_service_account or None,
             restart_policy="Never",
             image_pull_secrets=[client.V1LocalObjectReference(name=image_pull_secret)] if image_pull_secret else None,
         ),

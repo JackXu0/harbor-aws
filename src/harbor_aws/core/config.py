@@ -42,7 +42,7 @@ class AWSConfig:
     # EKS
     eks_cluster_name: str = "harbor-aws"
     namespace: str = "harbor"
-    service_account_name: str = "harbor-pod"
+    k8s_service_account: str | None = None
 
     # AWS account (needed for ECR pull-through cache URI)
     account_id: str | None = None
@@ -126,6 +126,7 @@ async def load_config_from_stack(
         stack_name=stack_name,
         eks_cluster_name=outputs.get("EksClusterName", "harbor-aws"),
         namespace=outputs.get("Namespace", "harbor"),
+        k8s_service_account=outputs.get("PodServiceAccount"),
         account_id=account_id,
     )
 
