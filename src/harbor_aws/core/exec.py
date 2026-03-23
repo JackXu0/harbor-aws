@@ -17,34 +17,6 @@ _TRANSIENT_ERRORS = ("Handshake status", "Unauthorized", "nodename nor servname"
                      "Connection reset", "timed out")
 
 
-
-def _make_isolated_api() -> client.CoreV1Api:
-    """Return a CoreV1Api with its own ApiClient to avoid stream() thread-safety issues."""
-    from harbor_aws.core.config import ensure_fresh_kubeconfig
-
-    ensure_fresh_kubeconfig()
-    return client.CoreV1Api(api_client=client.ApiClient())
-
-
-def _build_full_command(
-    command: str,
-    cwd: str | None = None,
-    env: dict[str, str] | None = None,
-) -> str:
-    """Build the full command string with cwd and env vars from Harbor."""
-    parts = []
-
-    if env:
-        for key, value in env.items():
-            parts.append(f"export {key}={shlex.quote(value)};")
-
-    if cwd:
-        parts.append(f"cd {shlex.quote(cwd)} &&")
-
-    parts.append(command)
-    return " ".join(parts)
-
-
 async def exec_command(
     api: client.CoreV1Api,
     pod_name: str,
@@ -102,6 +74,36 @@ async def exec_command(
         return (stdout or None, stderr or None, return_code)
 
     return await asyncio.to_thread(_exec)
+
+
+# --- helpers ---
+
+
+def _make_isolated_api() -> client.CoreV1Api:
+    """Return a CoreV1Api with its own ApiClient to avoid stream() thread-safety issues."""
+    from harbor_aws.core.config import ensure_fresh_kubeconfig
+
+    ensure_fresh_kubeconfig()
+    return client.CoreV1Api(api_client=client.ApiClient())
+
+
+def _build_full_command(
+    command: str,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Build the full command string with cwd and env vars from Harbor."""
+    parts = []
+
+    if env:
+        for key, value in env.items():
+            parts.append(f"export {key}={shlex.quote(value)};")
+
+    if cwd:
+        parts.append(f"cd {shlex.quote(cwd)} &&")
+
+    parts.append(command)
+    return " ".join(parts)
 
 
 def _parse_return_code(stdout: str) -> int:
