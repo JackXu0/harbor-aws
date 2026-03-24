@@ -13,7 +13,13 @@ AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 ## Install
 
 ```bash
-uv sync --extra cdk
+pip install harbor-aws
+```
+
+To deploy infrastructure (requires CDK):
+
+```bash
+pip install "harbor-aws[cdk]"
 ```
 
 ## Quick Start
