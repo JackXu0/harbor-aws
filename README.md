@@ -26,18 +26,18 @@ pip install "harbor-aws[cdk]"
 
 ```bash
 # Deploy infrastructure (one-time, ~15 min)
-uv run python -m harbor_aws deploy
+python -m harbor_aws deploy
 
 # Run benchmarks
-uv run harbor run -c job-config.yaml \
+harbor run -c job-config.yaml \
   -d terminal-bench@2.0 \
   -a terminus-2 \
   -m bedrock/converse/moonshotai.kimi-k2.5 \
   -n 89
 
 # Clean up
-uv run python -m harbor_aws stop      # delete pods, keep infra
-uv run python -m harbor_aws destroy   # delete everything
+python -m harbor_aws stop      # delete pods, keep infra
+python -m harbor_aws destroy   # delete everything
 ```
 
 > **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
