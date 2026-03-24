@@ -51,6 +51,9 @@ class AWSConfig:
     # ECR pull-through cache (opt-in, requires setup — see README)
     ecr_cache: bool = False
 
+    # Maximum pod lifetime in seconds (default: 4 hours)
+    pod_timeout_sec: int = 14400
+
     # Stack-based configuration
     stack_name: str | None = None
 

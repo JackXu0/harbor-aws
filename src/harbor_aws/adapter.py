@@ -65,6 +65,7 @@ class AWSEnvironment(BaseEnvironment):
         ecr_cache: bool = False,
         cpus: int | None = None,
         memory_mb: int | None = None,
+        pod_timeout_sec: int = 14400,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -88,6 +89,7 @@ class AWSEnvironment(BaseEnvironment):
 
         self._cpus_override = int(cpus) if cpus is not None else None
         self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
+        self._pod_timeout_sec = int(pod_timeout_sec)
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
@@ -129,6 +131,8 @@ class AWSEnvironment(BaseEnvironment):
             )
             self._aws_config.ecr_cache = ecr_cache
             AWSEnvironment._cached_stack_config = self._aws_config
+
+        self._aws_config.pod_timeout_sec = self._pod_timeout_sec
 
         # Bedrock access requires a K8s service account with AWS credentials.
         # The CDK stack creates one automatically (see cdk/stack.py).

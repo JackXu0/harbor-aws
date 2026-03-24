@@ -52,6 +52,7 @@ async def create_pod(
                     resources=client.V1ResourceRequirements(requests=resources, limits=resources),
                 ),
             ],
+            active_deadline_seconds=config.pod_timeout_sec,
             service_account_name=config.k8s_service_account or None,
             restart_policy="Never",
             image_pull_secrets=[client.V1LocalObjectReference(name=image_pull_secret)] if image_pull_secret else None,
