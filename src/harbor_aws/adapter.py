@@ -259,7 +259,21 @@ class AWSEnvironment(BaseEnvironment):
         image = None
         commands: list[str] = []
 
-        for line in dockerfile.read_text().splitlines():
+        # Join backslash-continued lines before parsing
+        raw_lines = dockerfile.read_text().splitlines()
+        logical_lines: list[str] = []
+        current = ""
+        for raw in raw_lines:
+            if raw.rstrip().endswith("\\"):
+                current += raw.rstrip()[:-1]
+            else:
+                current += raw
+                logical_lines.append(current)
+                current = ""
+        if current:
+            logical_lines.append(current)
+
+        for line in logical_lines:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
