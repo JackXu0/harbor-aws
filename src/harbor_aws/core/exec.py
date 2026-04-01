@@ -84,7 +84,8 @@ def _make_isolated_api() -> client.CoreV1Api:
     from harbor_aws.core.config import ensure_fresh_kubeconfig
 
     ensure_fresh_kubeconfig()
-    return client.CoreV1Api(api_client=client.ApiClient())
+    config_with_token = client.Configuration.get_default_copy()
+    return client.CoreV1Api(api_client=client.ApiClient(configuration=config_with_token))
 
 
 def _build_full_command(
