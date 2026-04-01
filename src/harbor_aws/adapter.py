@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -49,6 +51,7 @@ class AWSEnvironment(BaseEnvironment):
     _image_pull_semaphore: asyncio.Semaphore | None = None
     _image_pull_semaphore_size: int = 0
     _setup_semaphore: asyncio.Semaphore | None = None
+    _build_locks: dict[str, asyncio.Lock] = {}
 
     def __init__(
         self,
@@ -287,6 +290,74 @@ class AWSEnvironment(BaseEnvironment):
 
         return image, commands
 
+    # -- Image build & cache -----------------------------------------------
+
+    _ECR_REPO = "harbor-build"
+
+    async def _get_or_build_image(self) -> str | None:
+        """Build a Docker image from the environment Dockerfile and cache it in ECR.
+
+        Returns the ECR image URI if successful, None if no Dockerfile or Docker unavailable.
+        """
+        dockerfile = self.environment_dir / "Dockerfile"
+        if not dockerfile.exists():
+            return None
+
+        tag = hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:16]
+        account = self._aws_config.account_id
+        region = self._aws_config.region
+        ecr_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{self._ECR_REPO}:{tag}"
+
+        # Per-tag lock to avoid duplicate builds
+        if tag not in AWSEnvironment._build_locks:
+            AWSEnvironment._build_locks[tag] = asyncio.Lock()
+
+        async with AWSEnvironment._build_locks[tag]:
+            if await asyncio.to_thread(self._ecr_image_exists, tag):
+                self.logger.debug("Using cached image %s", ecr_uri)
+                return ecr_uri
+
+            self.logger.info("Building and pushing image %s", ecr_uri)
+            await asyncio.to_thread(self._docker_build_and_push, ecr_uri)
+            return ecr_uri
+
+    def _ecr_image_exists(self, tag: str) -> bool:
+        session = self._aws_config.create_boto3_session()
+        ecr = session.client("ecr", region_name=self._aws_config.region)
+        try:
+            ecr.describe_images(repositoryName=self._ECR_REPO, imageIds=[{"imageTag": tag}])
+            return True
+        except (ecr.exceptions.ImageNotFoundException, ecr.exceptions.RepositoryNotFoundException):
+            return False
+
+    def _docker_build_and_push(self, ecr_uri: str) -> None:
+        session = self._aws_config.create_boto3_session()
+        ecr = session.client("ecr", region_name=self._aws_config.region)
+
+        # Ensure repo exists with 90-day lifecycle policy
+        try:
+            ecr.create_repository(repositoryName=self._ECR_REPO)
+            ecr.put_lifecycle_policy(repositoryName=self._ECR_REPO, lifecyclePolicyText=json.dumps(
+                {"rules": [{"rulePriority": 1, "action": {"type": "expire"},
+                 "selection": {"tagStatus": "any", "countType": "sinceImagePushed",
+                               "countUnit": "days", "countNumber": 90}}]},
+            ))
+        except ecr.exceptions.RepositoryAlreadyExistsException:
+            pass
+
+        # Login to ECR
+        auth = ecr.get_authorization_token()["authorizationData"][0]
+        token = base64.b64decode(auth["authorizationToken"]).decode()
+        username, password = token.split(":", 1)
+        subprocess.run(
+            ["docker", "login", "--username", username, "--password-stdin", auth["proxyEndpoint"]],
+            input=password, capture_output=True, text=True, check=True,
+        )
+
+        # Build and push
+        subprocess.run(["docker", "build", "-t", ecr_uri, str(self.environment_dir)], check=True, capture_output=True, text=True)
+        subprocess.run(["docker", "push", ecr_uri], check=True, capture_output=True, text=True)
+
     # -- Lifecycle ---------------------------------------------------------
 
     async def start(self, force_build: bool) -> None:
@@ -298,7 +369,12 @@ class AWSEnvironment(BaseEnvironment):
         image_uri = self.task_env_config.docker_image
         dockerfile_commands: list[str] = []
         if not image_uri:
-            image_uri, dockerfile_commands = self._parse_dockerfile()
+            # Try build-and-cache when ECR cache is enabled
+            if self._aws_config.ecr_cache:
+                image_uri = await self._get_or_build_image()
+            # Fall back to exec-based Dockerfile setup
+            if not image_uri:
+                image_uri, dockerfile_commands = self._parse_dockerfile()
         if not image_uri:
             raise RuntimeError(
                 "No docker_image specified and no Dockerfile found. "
