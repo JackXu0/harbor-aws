@@ -108,7 +108,9 @@ def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
             _kubeconfig_setup = True
 
     ensure_fresh_kubeconfig()
-    return client.CoreV1Api()
+    cfg = client.Configuration.get_default_copy()
+    cfg.connection_pool_maxsize = 500
+    return client.CoreV1Api(api_client=client.ApiClient(configuration=cfg))
 
 
 async def load_config_from_stack(
