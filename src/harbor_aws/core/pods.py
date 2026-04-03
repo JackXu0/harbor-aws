@@ -48,6 +48,7 @@ async def create_pod(
                     name="main",
                     image=image_uri,
                     command=["sleep", "infinity"],
+                    security_context=client.V1SecurityContext(run_as_user=0),
                     env=[client.V1EnvVar(name=k, value=v) for k, v in (env_vars or {}).items()] or None,
                     resources=client.V1ResourceRequirements(requests=resources, limits=resources),
                 ),
