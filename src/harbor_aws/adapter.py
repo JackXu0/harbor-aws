@@ -475,10 +475,14 @@ class AWSEnvironment(BaseEnvironment):
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult:
         """Execute a command in the pod via Kubernetes exec."""
         if not self._pod_name:
             raise RuntimeError("Pod not running. Call start() first.")
+
+        if user is not None:
+            command = f"su - {user} -c {command!r}" if isinstance(user, str) else f"su - $(id -un {user}) -c {command!r}"
 
         stdout, stderr, return_code = await exec.exec_command(
             api=self._k8s_api,
