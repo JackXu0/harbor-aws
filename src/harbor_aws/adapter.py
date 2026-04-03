@@ -336,14 +336,14 @@ class AWSEnvironment(BaseEnvironment):
 
         # Ensure repo exists with 90-day lifecycle policy
         try:
+            ecr.describe_repositories(repositoryNames=[self._ECR_REPO])
+        except ecr.exceptions.RepositoryNotFoundException:
             ecr.create_repository(repositoryName=self._ECR_REPO)
             ecr.put_lifecycle_policy(repositoryName=self._ECR_REPO, lifecyclePolicyText=json.dumps(
                 {"rules": [{"rulePriority": 1, "action": {"type": "expire"},
                  "selection": {"tagStatus": "any", "countType": "sinceImagePushed",
                                "countUnit": "days", "countNumber": 90}}]},
             ))
-        except ecr.exceptions.RepositoryAlreadyExistsException:
-            pass
 
         # Login to ECR
         auth = ecr.get_authorization_token()["authorizationData"][0]
