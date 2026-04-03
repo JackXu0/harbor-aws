@@ -52,6 +52,7 @@ class AWSEnvironment(BaseEnvironment):
     _image_pull_semaphore_size: int = 0
     _setup_semaphore: asyncio.Semaphore | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
+    _config_lock: asyncio.Lock | None = None
 
     def __init__(
         self,
@@ -121,36 +122,27 @@ class AWSEnvironment(BaseEnvironment):
     # -- Initialization helpers --------------------------------------------
 
     async def _ensure_config(self) -> None:
-        """Load cluster config from CloudFormation and resolve account_id."""
-        if AWSEnvironment._cached_stack_config is not None:
-            self._aws_config = AWSEnvironment._cached_stack_config
-        else:
-            self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
-            ecr_cache = self._aws_config.ecr_cache
-            self._aws_config = await load_config_from_stack(
-                stack_name=self._aws_config.stack_name,
-                region=self._aws_config.region,
-                role_arn=self._aws_config.role_arn,
-            )
-            self._aws_config.ecr_cache = ecr_cache
-            AWSEnvironment._cached_stack_config = self._aws_config
+        """Load cluster config from CloudFormation (once) and apply per-instance overrides."""
+        if AWSEnvironment._cached_stack_config is None:
+            if AWSEnvironment._config_lock is None:
+                AWSEnvironment._config_lock = asyncio.Lock()
+            async with AWSEnvironment._config_lock:
+                if AWSEnvironment._cached_stack_config is None:
+                    self.logger.debug("Loading config from stack '%s'", self._aws_config.stack_name)
+                    AWSEnvironment._cached_stack_config = await load_config_from_stack(
+                        stack_name=self._aws_config.stack_name,
+                        region=self._aws_config.region,
+                        role_arn=self._aws_config.role_arn,
+                    )
 
-        self._aws_config.pod_timeout_sec = self._pod_timeout_sec
-
-        # Bedrock access requires a K8s service account with AWS credentials.
-        # The CDK stack creates one automatically (see cdk/stack.py).
-        if not self._bedrock:
-            self._aws_config.k8s_service_account = None
-
-        # Resolve account_id for ECR pull-through cache if not already set.
-        if self._aws_config.ecr_cache and not self._aws_config.account_id:
-            try:
-                session = self._aws_config.create_boto3_session()
-                self._aws_config.account_id = await asyncio.to_thread(
-                    lambda: session.client("sts").get_caller_identity()["Account"]
-                )
-            except Exception as e:
-                self.logger.warning("Could not resolve AWS account ID for ECR cache: %s", e)
+        # Copy shared config and apply per-instance overrides.
+        from dataclasses import replace
+        self._aws_config = replace(
+            AWSEnvironment._cached_stack_config,
+            ecr_cache=self._aws_config.ecr_cache,
+            pod_timeout_sec=self._pod_timeout_sec,
+            k8s_service_account=AWSEnvironment._cached_stack_config.k8s_service_account if self._bedrock else None,
+        )
 
     def _ensure_k8s_client(self) -> None:
         """Initialize Kubernetes API client (shared across instances)."""
