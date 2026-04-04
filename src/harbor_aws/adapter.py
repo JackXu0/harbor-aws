@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -45,6 +46,7 @@ class AWSEnvironment(BaseEnvironment):
 
     # -- Class-level shared state (avoid repeated API calls across instances) --
     _cached_stack_config: AWSConfig | None = None
+    _config_lock: asyncio.Lock | None = None
     _shared_k8s_api = None
     _docker_secret_checked = False
     _docker_secret_name: str | None = None
@@ -52,7 +54,6 @@ class AWSEnvironment(BaseEnvironment):
     _image_pull_semaphore_size: int = 0
     _setup_semaphore: asyncio.Semaphore | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
-    _config_lock: asyncio.Lock | None = None
 
     def __init__(
         self,
@@ -135,8 +136,6 @@ class AWSEnvironment(BaseEnvironment):
                         role_arn=self._aws_config.role_arn,
                     )
 
-        # Copy shared config and apply per-instance overrides.
-        from dataclasses import replace
         self._aws_config = replace(
             AWSEnvironment._cached_stack_config,
             ecr_cache=self._aws_config.ecr_cache,
@@ -171,53 +170,33 @@ class AWSEnvironment(BaseEnvironment):
         """Create imagePullSecret from ~/.docker/config.json if not already present."""
         if AWSEnvironment._docker_secret_checked:
             return
+        AWSEnvironment._docker_secret_checked = True
 
-        secret_name = "dockerhub-creds"
         docker_cfg = Path.home() / ".docker" / "config.json"
         if not docker_cfg.exists():
-            AWSEnvironment._docker_secret_checked = True
             return
-
         try:
-            cfg_data = json.loads(docker_cfg.read_text())
-            has_dockerhub = any(
-                "docker.io" in k or "index.docker.io" in k
-                for k in cfg_data.get("auths", {})
-            )
-            if not has_dockerhub:
-                AWSEnvironment._docker_secret_checked = True
-                return
+            auths = json.loads(docker_cfg.read_text()).get("auths", {})
         except (json.JSONDecodeError, OSError):
-            AWSEnvironment._docker_secret_checked = True
+            return
+        if not any("docker.io" in k for k in auths):
             return
 
+        secret_name = "dockerhub-creds"
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=secret_name),
+            type="kubernetes.io/dockerconfigjson",
+            data={".dockerconfigjson": base64.b64encode(docker_cfg.read_bytes()).decode()},
+        )
         try:
             await asyncio.to_thread(
-                self._k8s_api.read_namespaced_secret,
-                name=secret_name,
-                namespace=self._aws_config.namespace,
+                self._k8s_api.create_namespaced_secret,
+                namespace=self._aws_config.namespace, body=secret,
             )
         except client.ApiException as e:
-            if e.status != 404:
+            if e.status != 409:
                 raise
-            secret = client.V1Secret(
-                metadata=client.V1ObjectMeta(name=secret_name),
-                type="kubernetes.io/dockerconfigjson",
-                data={".dockerconfigjson": base64.b64encode(docker_cfg.read_bytes()).decode()},
-            )
-            try:
-                await asyncio.to_thread(
-                    self._k8s_api.create_namespaced_secret,
-                    namespace=self._aws_config.namespace,
-                    body=secret,
-                )
-                self.logger.debug("Created %s secret", secret_name)
-            except client.ApiException as create_err:
-                if create_err.status != 409:
-                    raise
-
         AWSEnvironment._docker_secret_name = secret_name
-        AWSEnvironment._docker_secret_checked = True
 
     # -- Image helpers -----------------------------------------------------
 
@@ -426,11 +405,7 @@ class AWSEnvironment(BaseEnvironment):
                     self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
 
             self.logger.debug("[start] creating log dirs in pod %s", self._pod_name)
-            try:
-                mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
-            except Exception as e:
-                self.logger.error("[start] mkdir FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
-                raise
+            mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
             if mkdir_result.return_code != 0:
                 raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
 
