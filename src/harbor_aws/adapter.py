@@ -409,20 +409,6 @@ class AWSEnvironment(BaseEnvironment):
             if mkdir_result.return_code != 0:
                 raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
 
-            # Install 'script' if missing — needed for tmux sessions in some benchmarks.
-            check = await self.exec("command -v script")
-            if check.return_code != 0:
-                self.logger.debug("[start] installing bsdutils in pod %s", self._pod_name)
-                install = await self.exec(
-                    "apt-get update -qq && apt-get install -y -qq bsdutils 2>/dev/null"
-                    " || apk add --no-cache util-linux 2>/dev/null"
-                    " || yum install -y util-linux 2>/dev/null"
-                    " || true",
-                    timeout_sec=120,
-                )
-                if install.return_code != 0:
-                    self.logger.warning("[start] bsdutils install may have failed (rc=%d) in %s", install.return_code, self._pod_name)
-
         self.logger.debug("[start] pod %s fully ready", self._pod_name)
 
     async def stop(self, delete: bool) -> None:
