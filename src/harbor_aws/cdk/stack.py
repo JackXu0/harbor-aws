@@ -3,8 +3,8 @@
 This is the single source of truth for all AWS resources.
 """
 
-from constructs import Construct
-
+# ruff: noqa: I001 — ruff isort wants to split the multi-alias aws_cdk
+# block into one import per submodule, which is uglier than this form.
 import aws_cdk as cdk
 from aws_cdk import (
     aws_ec2 as ec2,
@@ -14,6 +14,7 @@ from aws_cdk import (
     aws_logs as logs,
 )
 from aws_cdk.lambda_layer_kubectl_v31 import KubectlV31Layer
+from constructs import Construct
 
 
 class HarborAWSStack(cdk.Stack):

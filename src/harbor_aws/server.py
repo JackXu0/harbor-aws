@@ -42,6 +42,7 @@ import secrets
 import struct
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from aiohttp import web
 
@@ -82,16 +83,16 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
     return bytes(buf)
 
 
-async def recv_frame(reader: asyncio.StreamReader) -> dict:
+async def recv_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
     header = await _read_exactly(reader, 4)
     (length,) = struct.unpack(">I", header)
     if length == 0 or length > 64 * 1024 * 1024:
         raise ValueError(f"invalid frame length {length}")
     payload = await _read_exactly(reader, length)
-    return json.loads(payload.decode("utf-8"))
+    return json.loads(payload.decode("utf-8"))  # type: ignore[no-any-return]
 
 
-def encode_frame(msg: dict) -> bytes:
+def encode_frame(msg: dict[str, Any]) -> bytes:
     payload = json.dumps(msg).encode("utf-8")
     return struct.pack(">I", len(payload)) + payload
 
@@ -183,7 +184,7 @@ class ControlServer:
                 asyncio.open_connection(t.pod_ip, t.pod_port),
                 timeout=connect_timeout,
             )
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             raise TimeoutError(
                 f"open_connection({t.pod_ip}:{t.pod_port}) timed out after {connect_timeout}s"
             ) from e
@@ -194,7 +195,7 @@ class ControlServer:
         try:
             await asyncio.wait_for(writer.drain(), timeout=10.0)
             msg = await asyncio.wait_for(recv_frame(reader), timeout=10.0)
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             raise TimeoutError(f"auth handshake with {t.pod_ip}:{t.pod_port} timed out") from e
         if msg.get("type") != "auth_ok":
             raise RuntimeError(f"auth failed for {t.trial_id}: {msg}")
@@ -331,7 +332,7 @@ class ControlServer:
 
         try:
             stdout, stderr, rc = await asyncio.wait_for(fut, timeout=timeout_sec + 30)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             t.inflight.pop(cmd_id, None)
             return web.json_response(
                 {"stdout": "", "stderr": "control-server timeout", "rc": 124}

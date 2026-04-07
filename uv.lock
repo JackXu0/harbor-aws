@@ -1130,9 +1130,10 @@ wheels = [
 
 [[package]]
 name = "harbor-aws"
-version = "0.1.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "boto3" },
     { name = "harbor" },
     { name = "kubernetes" },
@@ -1156,6 +1157,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.10.0" },
     { name = "aws-cdk-lambda-layer-kubectl-v31", marker = "extra == 'cdk'", specifier = ">=2.0.0" },
     { name = "aws-cdk-lib", marker = "extra == 'cdk'", specifier = ">=2.150.0" },
     { name = "boto3", specifier = ">=1.35.0" },

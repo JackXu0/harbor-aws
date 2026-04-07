@@ -149,7 +149,7 @@ def _destroy(args: argparse.Namespace) -> None:
         print(f"  EKS:        cluster '{outputs['EksClusterName']}' (+ delete pods)")
     if ecr_count:
         print(f"  ECR:        {ecr_count} pull-through cache repos (docker-hub/*)")
-    print(f"  + VPC, IAM roles, log groups")
+    print("  + VPC, IAM roles, log groups")
 
     if not args.yes:
         confirm = input("\nProceed? [y/N] ")

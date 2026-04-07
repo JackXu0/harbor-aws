@@ -12,6 +12,7 @@ Architecture (Layer 3, the only path on this branch):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -120,7 +121,7 @@ class AWSEnvironment(BaseEnvironment):
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
-        self._shell = None  # PersistentShell instance
+        self._shell: RemoteShell | None = None
 
     # -- Properties --------------------------------------------------------
 

@@ -155,7 +155,7 @@ async def _wait_for_pod_event(
 
     try:
         await asyncio.wait_for(getattr(handle, event).wait(), timeout=timeout_sec)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         if not swallow_timeout:
             raise RuntimeError(f"Pod {pod_name} {event} timed out after {timeout_sec}s") from None
         logger.debug("Pod %s %s timed out after %ds — continuing", pod_name, event, timeout_sec)
