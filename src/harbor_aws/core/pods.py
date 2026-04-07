@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 
 from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
@@ -134,6 +135,14 @@ async def _wait_for_pod_event(
 
 
 def _make_pod_name(session_id: str) -> str:
-    """Create a valid Kubernetes pod name from a session ID."""
-    name = re.sub(r"[^a-z0-9-]", "-", session_id.lower())[:58]
-    return f"hb-{name.strip('-')}"
+    """Create a valid Kubernetes pod name from a session ID.
+
+    Appends a short random suffix so retry attempts of the same trial create
+    distinct pods. This avoids racing the slow async deletion of the previous
+    attempt's pod, which used to surface as 'Pod was deleted' errors on the
+    new attempt's wait_for_image_pulled.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    # Reserve 3 chars for "hb-" prefix and 7 for "-{suffix}" → 53 left for the slug.
+    name = re.sub(r"[^a-z0-9-]", "-", session_id.lower())[:53].strip("-")
+    return f"hb-{name}-{suffix}"

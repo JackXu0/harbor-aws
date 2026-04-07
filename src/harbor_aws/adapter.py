@@ -50,8 +50,6 @@ class AWSEnvironment(BaseEnvironment):
     _shared_k8s_api = None
     _docker_secret_checked = False
     _docker_secret_name: str | None = None
-    _image_pull_semaphore: asyncio.Semaphore | None = None
-    _image_pull_semaphore_size: int = 0
     _setup_semaphore: asyncio.Semaphore | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
 
@@ -71,6 +69,7 @@ class AWSEnvironment(BaseEnvironment):
         cpus: int | None = None,
         memory_mb: int | None = None,
         pod_timeout_sec: int = 14400,
+        skip_image_check: bool = False,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -95,9 +94,11 @@ class AWSEnvironment(BaseEnvironment):
         self._cpus_override = int(cpus) if cpus is not None else None
         self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
         self._pod_timeout_sec = int(pod_timeout_sec)
+        self._skip_image_check = skip_image_check if isinstance(skip_image_check, bool) else str(skip_image_check).lower() == "true"
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
+        self._shell = None  # PersistentShell instance
 
     # -- Properties --------------------------------------------------------
 
@@ -150,6 +151,13 @@ class AWSEnvironment(BaseEnvironment):
                 AWSEnvironment._shared_k8s_api = create_k8s_client(self._aws_config)
             self._k8s_api = AWSEnvironment._shared_k8s_api
 
+    _ECR_SEMAPHORE_LIMIT = 50
+    _CREATE_SEMAPHORE_LIMIT = 100
+    _CONNECT_SEMAPHORE_LIMIT = 100
+    _ecr_semaphore: asyncio.Semaphore | None = None
+    _create_semaphore: asyncio.Semaphore | None = None
+    _connect_semaphore: asyncio.Semaphore | None = None
+
     @classmethod
     def _get_setup_semaphore(cls) -> asyncio.Semaphore:
         if cls._setup_semaphore is None:
@@ -157,12 +165,22 @@ class AWSEnvironment(BaseEnvironment):
         return cls._setup_semaphore
 
     @classmethod
-    def _get_pull_semaphore(cls, ecr_cache: bool = False) -> asyncio.Semaphore:
-        limit = 500 if ecr_cache else 50
-        if cls._image_pull_semaphore is None or cls._image_pull_semaphore_size != limit:
-            cls._image_pull_semaphore = asyncio.Semaphore(limit)
-            cls._image_pull_semaphore_size = limit
-        return cls._image_pull_semaphore
+    def _get_ecr_semaphore(cls) -> asyncio.Semaphore:
+        if cls._ecr_semaphore is None:
+            cls._ecr_semaphore = asyncio.Semaphore(cls._ECR_SEMAPHORE_LIMIT)
+        return cls._ecr_semaphore
+
+    @classmethod
+    def _get_create_semaphore(cls) -> asyncio.Semaphore:
+        if cls._create_semaphore is None:
+            cls._create_semaphore = asyncio.Semaphore(cls._CREATE_SEMAPHORE_LIMIT)
+        return cls._create_semaphore
+
+    @classmethod
+    def _get_connect_semaphore(cls) -> asyncio.Semaphore:
+        if cls._connect_semaphore is None:
+            cls._connect_semaphore = asyncio.Semaphore(cls._CONNECT_SEMAPHORE_LIMIT)
+        return cls._connect_semaphore
 
     # -- Docker Hub credentials --------------------------------------------
 
@@ -279,14 +297,20 @@ class AWSEnvironment(BaseEnvironment):
         region = self._aws_config.region
         ecr_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{self._ECR_REPO}:{tag}"
 
+        # Skip ECR check if images are known to exist (e.g., pre-cached run).
+        if self._skip_image_check:
+            self.logger.debug("Using image (skip check) %s", ecr_uri)
+            return ecr_uri
+
         # Per-tag lock to avoid duplicate builds
         if tag not in AWSEnvironment._build_locks:
             AWSEnvironment._build_locks[tag] = asyncio.Lock()
 
         async with AWSEnvironment._build_locks[tag]:
-            if await asyncio.to_thread(self._ecr_image_exists, tag):
-                self.logger.debug("Using cached image %s", ecr_uri)
-                return ecr_uri
+            async with self._get_ecr_semaphore():
+                if await asyncio.to_thread(self._ecr_image_exists, tag):
+                    self.logger.debug("Using cached image %s", ecr_uri)
+                    return ecr_uri
 
             self.logger.info("Building and pushing image %s", ecr_uri)
             await asyncio.to_thread(self._docker_build_and_push, ecr_uri)
@@ -333,17 +357,20 @@ class AWSEnvironment(BaseEnvironment):
 
     async def start(self, force_build: bool) -> None:
         """Start a Kubernetes pod for the benchmark task."""
+        import time as _time
+        _t0 = _time.monotonic()
+
         await self._ensure_config()
         self._ensure_k8s_client()
         await self._ensure_docker_pull_secret()
+        _t_init = _time.monotonic()
 
         image_uri = self.task_env_config.docker_image
         dockerfile_commands: list[str] = []
         if not image_uri:
-            # Try build-and-cache when ECR cache is enabled
-            if self._aws_config.ecr_cache:
-                image_uri = await self._get_or_build_image()
-            # Fall back to exec-based Dockerfile setup
+            # Try to use a pre-built image from ECR cache
+            image_uri = await self._get_or_build_image()
+            # Fall back to exec-based Dockerfile setup (no Docker available)
             if not image_uri:
                 image_uri, dockerfile_commands = self._parse_dockerfile()
         if not image_uri:
@@ -354,15 +381,15 @@ class AWSEnvironment(BaseEnvironment):
 
         if self._aws_config.ecr_cache:
             image_uri = self._ecr_image_uri(image_uri)
-        self.logger.debug("Using image: %s", image_uri)
+        _t_image = _time.monotonic()
 
         profile = _match_resource_profile(image_uri)
         pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
         pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
 
-        # Limit concurrent image pulls (ECR: 500, Docker Hub: 50).
-        async with self._get_pull_semaphore(self._aws_config.ecr_cache):
-            self.logger.debug("[start] creating pod for %s", self.environment_name)
+        # Throttle pod creation to avoid K8s API contention.
+        async with self._get_create_semaphore():
+            _t_pull_enter = _time.monotonic()
             self._pod_name = await pods.create_pod(
                 self._k8s_api,
                 self._aws_config,
@@ -373,13 +400,15 @@ class AWSEnvironment(BaseEnvironment):
                 memory_mb=pod_memory,
                 image_pull_secret=AWSEnvironment._docker_secret_name,
             )
-            self.logger.debug("[start] pod created: %s", self._pod_name)
+        _t_created = _time.monotonic()
 
-            await pods.wait_for_image_pulled(
-                self._k8s_api,
-                self._aws_config,
-                self._pod_name,
-            )
+        # Wait for Fargate to pull image — no semaphore, all concurrent.
+        await pods.wait_for_image_pulled(
+            self._k8s_api,
+            self._aws_config,
+            self._pod_name,
+        )
+        _t_pulled = _time.monotonic()
 
         try:
             await pods.wait_for_pod_running(
@@ -390,10 +419,30 @@ class AWSEnvironment(BaseEnvironment):
         except Exception as e:
             self.logger.error("[start] wait_for_pod_running FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
             raise
-        self.logger.debug("[start] pod running: %s", self._pod_name)
+        _t_running = _time.monotonic()
 
-        # Throttle setup exec calls to avoid overwhelming the API server.
+        # Open persistent shell — one WebSocket per pod, reused for all exec calls.
+        # Cap concurrent WebSocket exec handshakes; the K8s apiserver returns
+        # 500 "tls: internal error" when too many simultaneous dials to fresh
+        # Fargate kubelets are in flight.
+        from harbor_aws.core.shell import PersistentShell
+        self._shell = PersistentShell(self._pod_name, self._aws_config.namespace)
+        async with self._get_connect_semaphore():
+            await self._shell.connect()
+        _t_shell = _time.monotonic()
+
+        self.logger.info(
+            "[timing] %s init=%.1f image=%.1f pull_wait=%.1f create=%.1f pulled=%.1f running=%.1f shell=%.1f",
+            self.environment_name,
+            _t_init - _t0, _t_image - _t_init, _t_pull_enter - _t_image,
+            _t_created - _t_pull_enter, _t_pulled - _t_created, _t_running - _t_pulled,
+            _t_shell - _t_running,
+        )
+
+        # Setup — all commands go through the persistent shell, no new WebSocket connections.
+        _t_setup_wait = _time.monotonic()
         async with self._get_setup_semaphore():
+            _t_setup_enter = _time.monotonic()
             for i, cmd in enumerate(dockerfile_commands):
                 self.logger.debug("[start] Dockerfile cmd %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
                 try:
@@ -404,21 +453,31 @@ class AWSEnvironment(BaseEnvironment):
                 if result.return_code != 0:
                     self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
 
-            self.logger.debug("[start] creating log dirs in pod %s", self._pod_name)
-            mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}")
+            mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir} {EnvironmentPaths.artifacts_dir}")
             if mkdir_result.return_code != 0:
                 raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
+        _t_done = _time.monotonic()
 
-        self.logger.debug("[start] pod %s fully ready", self._pod_name)
+        self.logger.info(
+            "[timing] %s setup_wait=%.1f setup_exec=%.1f TOTAL=%.1f",
+            self.environment_name,
+            _t_setup_enter - _t_setup_wait, _t_done - _t_setup_enter, _t_done - _t0,
+        )
 
     async def stop(self, delete: bool) -> None:
-        """Delete the pod."""
+        """Close shell and delete the pod."""
+        import time as _time
+        _t0 = _time.monotonic()
         try:
+            if self._shell:
+                await self._shell.close()
+                self._shell = None
             if self._pod_name and self._k8s_api:
                 await pods.delete_pod(self._k8s_api, self._aws_config, self._pod_name)
         except Exception as e:
             self.logger.warning("Error deleting pod: %s", e)
         finally:
+            self.logger.info("[timing] %s stop=%.1f", self.environment_name, _time.monotonic() - _t0)
             self._pod_name = None
             self._k8s_api = None
 
@@ -430,22 +489,28 @@ class AWSEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        """Execute a command in the pod via Kubernetes exec."""
+        """Execute a command in the pod via persistent shell."""
         if not self._pod_name:
             raise RuntimeError("Pod not running. Call start() first.")
 
         if user is not None:
             command = f"su - {user} -c {command!r}" if isinstance(user, str) else f"su - $(id -un {user}) -c {command!r}"
 
-        stdout, stderr, return_code = await exec.exec_command(
-            api=self._k8s_api,
-            pod_name=self._pod_name,
-            namespace=self._aws_config.namespace,
-            command=command,
-            cwd=cwd,
-            env=env,
-            timeout_sec=timeout_sec,
-        )
+        if self._shell:
+            stdout, stderr, return_code = await self._shell.run(
+                command, cwd=cwd, env=env, timeout_sec=timeout_sec or 300,
+            )
+        else:
+            # Fallback to per-call WebSocket if shell not available
+            stdout, stderr, return_code = await exec.exec_command(
+                api=self._k8s_api,
+                pod_name=self._pod_name,
+                namespace=self._aws_config.namespace,
+                command=command,
+                cwd=cwd,
+                env=env,
+                timeout_sec=timeout_sec,
+            )
 
         return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 
@@ -456,7 +521,34 @@ class AWSEnvironment(BaseEnvironment):
         await files.upload_dir(self._pod_name, self._aws_config.namespace, str(source_dir), target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        await files.download_file(self._pod_name, self._aws_config.namespace, source_path, str(target_path))
+        if self._shell:
+            import base64, io, tarfile
+            target = Path(target_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src = Path(source_path)
+            stdout, _, rc = await self._shell.run(
+                f"tar czf - -C {src.parent} {src.name} | base64", timeout_sec=120,
+            )
+            if rc != 0 or not stdout.strip():
+                raise RuntimeError(f"download_file failed (rc={rc})")
+            data = base64.b64decode(stdout)
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+                target.write_bytes(tar.extractfile(tar.getmembers()[0]).read())
+        else:
+            await files.download_file(self._pod_name, self._aws_config.namespace, source_path, str(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        await files.download_dir(self._pod_name, self._aws_config.namespace, source_dir, str(target_dir))
+        if self._shell:
+            import base64, io, tarfile
+            target = Path(target_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            stdout, _, rc = await self._shell.run(
+                f"tar czf - -C {source_dir} . | base64", timeout_sec=120,
+            )
+            if rc != 0 or not stdout.strip():
+                raise RuntimeError(f"download_dir failed (rc={rc})")
+            data = base64.b64decode(stdout)
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+                tar.extractall(path=str(target), filter="data")
+        else:
+            await files.download_dir(self._pod_name, self._aws_config.namespace, source_dir, str(target_dir))
