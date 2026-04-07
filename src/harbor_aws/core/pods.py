@@ -25,89 +25,17 @@ async def create_pod(
     session_id: str,
     cpus: int,
     memory_mb: int,
-    env_vars: dict[str, str] | None = None,
-    image_pull_secret: str | None = None,
-) -> str:
-    """Create a pod that runs `sleep infinity` for exec calls. Returns the pod name."""
-    pod_name = _make_pod_name(session_id)
-    resources = {"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"}
-
-    pod = client.V1Pod(
-        metadata=client.V1ObjectMeta(
-            name=pod_name,
-            namespace=config.namespace,
-            labels={
-                "app": "harbor-aws",
-                "harbor-session": session_id[:63],
-                "harbor-env": environment_name[:63],
-                "managed-by": "harbor-aws",
-            },
-        ),
-        spec=client.V1PodSpec(
-            containers=[
-                client.V1Container(
-                    name="main",
-                    image=image_uri,
-                    command=["sleep", "infinity"],
-                    security_context=client.V1SecurityContext(run_as_user=0),
-                    env=[client.V1EnvVar(name=k, value=v) for k, v in (env_vars or {}).items()] or None,
-                    resources=client.V1ResourceRequirements(requests=resources, limits=resources),
-                ),
-            ],
-            active_deadline_seconds=config.pod_timeout_sec,
-            service_account_name=config.k8s_service_account or None,
-            restart_policy="Never",
-            image_pull_secrets=[client.V1LocalObjectReference(name=image_pull_secret)] if image_pull_secret else None,
-        ),
-    )
-
-    try:
-        await asyncio.to_thread(api.create_namespaced_pod, namespace=config.namespace, body=pod)
-    except client.ApiException as e:
-        if e.status == 409:
-            logger.debug("Pod %s already exists, reusing", pod_name)
-        else:
-            raise
-
-    logger.debug("Created pod: %s (image=%s, cpu=%d, memory=%dMi)", pod_name, image_uri, cpus, memory_mb)
-    return pod_name
-
-
-async def wait_for_image_pulled(
-    api: client.CoreV1Api, config: AWSConfig, pod_name: str, timeout_sec: int = 600,
-) -> None:
-    """Wait until the pod's image pull completes (O(1) API calls via shared watch)."""
-    await _wait_for_pod_event(config.namespace, pod_name, "image_pulled", timeout_sec, swallow_timeout=True)
-
-
-async def wait_for_pod_running(
-    api: client.CoreV1Api, config: AWSConfig, pod_name: str, timeout_sec: int = 1800,
-) -> None:
-    """Wait for pod to reach Running phase and be ready for exec."""
-    await _wait_for_pod_event(config.namespace, pod_name, "pod_running", timeout_sec, swallow_timeout=False)
-
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=2, max=15, jitter=3), reraise=True)
-async def create_layer3_pod(
-    api: client.CoreV1Api,
-    config: AWSConfig,
-    image_uri: str,
-    environment_name: str,
-    session_id: str,
-    cpus: int,
-    memory_mb: int,
     trial_token: str,
     runner_configmap: str,
     runner_port: int,
     image_pull_secret: str | None = None,
 ) -> str:
-    """Create a pod that runs the harbor-runner.py from a ConfigMap mount.
+    """Create a Fargate pod that runs the harbor runner.py as PID 1.
 
-    Differs from create_pod() in three ways:
-      1. Mounts the harbor-runner ConfigMap as /harbor-runner/runner.py
-      2. Container command is `python3 /harbor-runner/runner.py` (not sleep)
-      3. Sets HARBOR_TOKEN + HARBOR_LISTEN_PORT env vars so the runner knows
-         what to authenticate against and what port to listen on
+    The runner.py is shipped via the harbor-runner ConfigMap mounted at
+    /harbor-runner/runner.py. HARBOR_TOKEN authenticates the in-cluster
+    control server to the runner; HARBOR_LISTEN_PORT controls the runner's
+    bind port.
     """
     pod_name = _make_pod_name(session_id)
     resources = {"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"}
@@ -174,9 +102,19 @@ async def create_layer3_pod(
     return pod_name
 
 
-async def get_pod_ip(api: client.CoreV1Api, namespace: str, pod_name: str) -> str:
-    """Read the pod's status.podIP. Caller should have already waited for Running."""
-    p = await asyncio.to_thread(api.read_namespaced_pod, name=pod_name, namespace=namespace)
+async def wait_for_pod_ready(
+    api: client.CoreV1Api, config: AWSConfig, pod_name: str, timeout_sec: int = 1800,
+) -> str:
+    """Wait until the pod is Running, then return its podIP.
+
+    Uses the shared PodWatcher (one watch stream per namespace, regardless of
+    how many waiters) so we don't poll the apiserver. Combines what used to be
+    wait_for_image_pulled + wait_for_pod_running + get_pod_ip into one call —
+    every L3 trial follows that exact sequence and there's no reason to
+    separate them.
+    """
+    await _wait_for_pod_event(config.namespace, pod_name, "pod_running", timeout_sec, swallow_timeout=False)
+    p = await asyncio.to_thread(api.read_namespaced_pod, name=pod_name, namespace=config.namespace)
     if not p.status.pod_ip:
         raise RuntimeError(f"Pod {pod_name} has no podIP yet (phase={p.status.phase})")
     return p.status.pod_ip

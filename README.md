@@ -2,78 +2,48 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks.
+AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Designed for high-concurrency runs (thousands of trials in parallel) without `kubectl exec` in the data path.
 
-- **Low infrastructure overhead:** One line AWS infrastructure creation and destroy.
-- **High-concurrency execution:** Run Harbor benchmarks at max concurrency on AWS.
-- **Pay-on-demand execution:** Ensure cost scales with benchmark demand.
-
-![Architecture](https://raw.githubusercontent.com/JackXu0/harbor-aws/main/docs/architecture.png)
+- **Pay-on-demand execution:** Cost scales with benchmark demand. Fargate per-second billing for trial pods.
+- **High-concurrency execution:** 2,400+ commands/sec sustained throughput verified at 2,492 concurrent trials.
+- **No kubectl exec data path:** Trial pods run a TCP server (`runner.py`) and an in-cluster gateway (`server.py`) bridges to the orchestrator over a public NLB. The K8s apiserver is only used for `create_pod` / `delete_pod`.
 
 ## Install
 
 ```bash
 pip install harbor-aws
-```
 
-To deploy infrastructure (requires CDK):
-
-```bash
+# CDK extras for `python -m harbor_aws deploy`
 pip install "harbor-aws[cdk]"
 ```
 
 ## Quick Start
 
 ```bash
-# Deploy infrastructure (one-time, ~15 min)
-python -m harbor_aws deploy
+# 1. Deploy your harbor-aws cluster (one-time, ~15-20 min)
+python -m harbor_aws deploy --region us-east-1
 
-# Run benchmarks
-harbor run -c job-config.yaml \
-  -d terminal-bench@2.0 \
-  -a terminus-2 \
-  -m bedrock/converse/moonshotai.kimi-k2.5 \
-  -n 89
+# 2. Bootstrap the L3 control plane in the cluster:
+#    - Build & push the harbor-control image (uses src/harbor_aws/server.py)
+#    - Apply Deployment + Service(LoadBalancer) for harbor-control
+#    - Apply ConfigMap from src/harbor_aws/runner.py
+#    - Install AWS Load Balancer Controller if not already there
+#    See the layer3-outbound-runner branch's commit history for the full recipe.
 
-# Clean up
-python -m harbor_aws stop      # delete pods, keep infra
+# 3. Run benchmarks
+HARBOR_CONTROL_URL=https://<harbor-control-nlb-dns>:8443 \
+HARBOR_ADMIN_TOKEN=<your-token> \
+harbor jobs start -p ./task -a nop -n 2500 \
+  --environment-import-path harbor_aws.adapter:AWSEnvironment \
+  --ek stack_name=harbor-aws \
+  --disable-verification --max-retries 2
+
+# 4. Clean up
+python -m harbor_aws stop      # delete trial pods, keep infra
 python -m harbor_aws destroy   # delete everything
 ```
 
-> **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits.
-
-## Scaling
-
-Image pulls are capped at 50 concurrent operations by default to avoid Docker Hub rate limiting. For higher sustained concurrency, configure Amazon ECR pull-through cache for Docker Hub images.
-
-<details>
-<summary><strong>ECR pull-through cache setup</strong></summary>
-
-<br>
-
-During `deploy`, you'll be prompted to provide Docker Hub credentials. If provided, the deploy will automatically create the Secrets Manager secret and ECR cache rule.
-
-To set it up manually instead:
-
-```bash
-aws secretsmanager create-secret \
-  --name ecr-pullthroughcache/docker-hub \
-  --secret-string '{"username":"YOUR_DOCKERHUB_USER","accessToken":"YOUR_ACCESS_TOKEN"}' \
-  --region us-east-1
-```
-
-Then enable in job config:
-
-```yaml
-environment:
-  import_path: "harbor_aws.adapter:AWSEnvironment"
-  kwargs:
-    stack_name: harbor-aws
-    region: us-east-1
-    ecr_cache: true
-```
-
-</details>
+> **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits when building task images.
 
 ## Validation
 

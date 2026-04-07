@@ -21,7 +21,6 @@ _LABEL_SELECTOR = "managed-by=harbor-aws"
 class _PodWaitHandle:
     """Per-pod wait state."""
 
-    image_pulled: asyncio.Event = field(default_factory=asyncio.Event)
     pod_running: asyncio.Event = field(default_factory=asyncio.Event)
     error: Exception | None = None
     phase: str | None = None
@@ -169,7 +168,6 @@ class PodWatcher:
             if event["type"] == "DELETED":
                 if handle is not None:
                     handle.error = RuntimeError(f"Pod {pod_name} was deleted")
-                    self._set_event(handle.image_pulled)
                     self._set_event(handle.pod_running)
                 self._cached_statuses.pop(pod_name, None)
                 return
@@ -186,29 +184,20 @@ class PodWatcher:
         handle.phase = phase
         statuses = pod.status.container_statuses if pod.status else None
 
-        # Image pulled?
-        if not handle.image_pulled.is_set():
-            if phase in ("Running", "Failed", "Succeeded"):
-                self._set_event(handle.image_pulled)
-            elif statuses and not any(
-                cs.state and cs.state.waiting and (cs.state.waiting.reason or "") in ("ErrImagePull", "ImagePullBackOff")
-                for cs in statuses
-            ):
-                self._set_event(handle.image_pulled)
+        if handle.pod_running.is_set():
+            return
 
-        # Pod running?
-        if not handle.pod_running.is_set():
-            if phase in ("Failed", "Succeeded"):
-                handle.error = RuntimeError(f"Pod {pod_name} terminated: {self._failure_reason(pod)}")
-                self._set_event(handle.pod_running)
-            elif phase == "Running" and all(cs.ready for cs in (statuses or [])):
-                self._set_event(handle.pod_running)
-            else:
-                for cs in statuses or []:
-                    if cs.state and cs.state.waiting and "no space left on device" in (cs.state.waiting.message or ""):
-                        handle.error = RuntimeError(f"Pod {pod_name} image pull failed: {cs.state.waiting.message}")
-                        self._set_event(handle.pod_running)
-                        break
+        if phase in ("Failed", "Succeeded"):
+            handle.error = RuntimeError(f"Pod {pod_name} terminated: {self._failure_reason(pod)}")
+            self._set_event(handle.pod_running)
+        elif phase == "Running" and all(cs.ready for cs in (statuses or [])):
+            self._set_event(handle.pod_running)
+        else:
+            for cs in statuses or []:
+                if cs.state and cs.state.waiting and "no space left on device" in (cs.state.waiting.message or ""):
+                    handle.error = RuntimeError(f"Pod {pod_name} image pull failed: {cs.state.waiting.message}")
+                    self._set_event(handle.pod_running)
+                    break
 
     def _set_event(self, event: asyncio.Event) -> None:
         """Set an asyncio.Event from any thread."""

@@ -1,9 +1,17 @@
-"""Harbor BaseEnvironment adapter for AWS EKS/Fargate."""
+"""Harbor BaseEnvironment adapter for AWS EKS/Fargate.
+
+Architecture (Layer 3, the only path on this branch):
+
+  - kubectl create_pod / delete_pod via the K8s API server
+  - Pod runs harbor_aws/runner.py as PID 1 (mounted via ConfigMap)
+  - In-cluster harbor-control server (harbor_aws/server.py) dials the runner pod
+    over direct in-VPC TCP and bridges to the Mac over an NLB
+  - All exec / file transfer goes through the control server, NEVER kubectl exec
+"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import logging
@@ -20,17 +28,15 @@ from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from kubernetes import client
 
-from harbor_aws.core import exec, files, pods
+from harbor_aws.core import pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
+from harbor_aws.core.remote_shell import RemoteShell
 
-# Layer 3 mode: trial pods run a TCP server (runner.py) and the harbor-control
-# in-cluster gateway dials in. Mac talks to control server via HTTP. The
-# kubectl-exec WebSocket path is bypassed entirely.
-_LAYER3_ENABLED = os.environ.get("HARBOR_LAYER3", "").lower() in ("1", "true", "yes")
-_LAYER3_CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "http://localhost:8443")
-_LAYER3_ADMIN_TOKEN = os.environ.get("HARBOR_ADMIN_TOKEN", "")
-_LAYER3_RUNNER_CONFIGMAP = os.environ.get("HARBOR_RUNNER_CONFIGMAP", "harbor-runner")
-_LAYER3_RUNNER_PORT = int(os.environ.get("HARBOR_RUNNER_PORT", "8765"))
+# Layer 3 configuration — set by the harbor process before invoking the adapter.
+_CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "http://localhost:8443")
+_ADMIN_TOKEN = os.environ.get("HARBOR_ADMIN_TOKEN", "")
+_RUNNER_CONFIGMAP = os.environ.get("HARBOR_RUNNER_CONFIGMAP", "harbor-runner")
+_RUNNER_PORT = int(os.environ.get("HARBOR_RUNNER_PORT", "8765"))
 
 # Fargate resource profiles for known benchmark images.
 # Matched top-to-bottom by regex against the docker image URI.
@@ -61,11 +67,11 @@ class AWSEnvironment(BaseEnvironment):
     _shared_k8s_api = None
     _docker_secret_checked = False
     _docker_secret_name: str | None = None
-    _setup_semaphore: asyncio.Semaphore | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
-    # Layer 3: ONE shared aiohttp session across all RemoteShells in this process,
-    # so we have a single bounded connection pool to the harbor-control NLB instead
-    # of 2500 separate per-trial pools (which exhaust local FDs / NLB capacity).
+    # ONE shared aiohttp session across all RemoteShells in this process, so
+    # we have a single bounded connection pool to the harbor-control NLB
+    # instead of 2500 separate per-trial pools (which exhaust local FDs and
+    # NLB capacity).
     _shared_aiohttp_session: object | None = None  # aiohttp.ClientSession when set
     _shared_aiohttp_lock: asyncio.Lock | None = None
 
@@ -169,16 +175,8 @@ class AWSEnvironment(BaseEnvironment):
 
     _ECR_SEMAPHORE_LIMIT = 50
     _CREATE_SEMAPHORE_LIMIT = 100
-    _CONNECT_SEMAPHORE_LIMIT = 100
     _ecr_semaphore: asyncio.Semaphore | None = None
     _create_semaphore: asyncio.Semaphore | None = None
-    _connect_semaphore: asyncio.Semaphore | None = None
-
-    @classmethod
-    def _get_setup_semaphore(cls) -> asyncio.Semaphore:
-        if cls._setup_semaphore is None:
-            cls._setup_semaphore = asyncio.Semaphore(500)
-        return cls._setup_semaphore
 
     @classmethod
     def _get_ecr_semaphore(cls) -> asyncio.Semaphore:
@@ -191,12 +189,6 @@ class AWSEnvironment(BaseEnvironment):
         if cls._create_semaphore is None:
             cls._create_semaphore = asyncio.Semaphore(cls._CREATE_SEMAPHORE_LIMIT)
         return cls._create_semaphore
-
-    @classmethod
-    def _get_connect_semaphore(cls) -> asyncio.Semaphore:
-        if cls._connect_semaphore is None:
-            cls._connect_semaphore = asyncio.Semaphore(cls._CONNECT_SEMAPHORE_LIMIT)
-        return cls._connect_semaphore
 
     @classmethod
     async def _get_shared_aiohttp_session(cls):  # noqa: ANN206 — aiohttp imported lazily
@@ -421,116 +413,79 @@ class AWSEnvironment(BaseEnvironment):
         pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
         pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
 
-        # Per-trial token for Layer 3 (no-op in Layer 2 path)
-        trial_token = secrets.token_urlsafe(16) if _LAYER3_ENABLED else ""
+        # Per-trial token used by the runner to authenticate the control server.
+        trial_token = secrets.token_urlsafe(16)
 
         # Throttle pod creation to avoid K8s API contention.
         async with self._get_create_semaphore():
             _t_pull_enter = _time.monotonic()
-            if _LAYER3_ENABLED:
-                self._pod_name = await pods.create_layer3_pod(
-                    self._k8s_api,
-                    self._aws_config,
-                    image_uri,
-                    self.environment_name,
-                    self.session_id,
-                    cpus=pod_cpus,
-                    memory_mb=pod_memory,
-                    trial_token=trial_token,
-                    runner_configmap=_LAYER3_RUNNER_CONFIGMAP,
-                    runner_port=_LAYER3_RUNNER_PORT,
-                    image_pull_secret=AWSEnvironment._docker_secret_name,
-                )
-            else:
-                self._pod_name = await pods.create_pod(
-                    self._k8s_api,
-                    self._aws_config,
-                    image_uri,
-                    self.environment_name,
-                    self.session_id,
-                    cpus=pod_cpus,
-                    memory_mb=pod_memory,
-                    image_pull_secret=AWSEnvironment._docker_secret_name,
-                )
-        _t_created = _time.monotonic()
-
-        # Wait for Fargate to pull image — no semaphore, all concurrent.
-        await pods.wait_for_image_pulled(
-            self._k8s_api,
-            self._aws_config,
-            self._pod_name,
-        )
-        _t_pulled = _time.monotonic()
-
-        try:
-            await pods.wait_for_pod_running(
+            self._pod_name = await pods.create_pod(
                 self._k8s_api,
                 self._aws_config,
-                self._pod_name,
+                image_uri,
+                self.environment_name,
+                self.session_id,
+                cpus=pod_cpus,
+                memory_mb=pod_memory,
+                trial_token=trial_token,
+                runner_configmap=_RUNNER_CONFIGMAP,
+                runner_port=_RUNNER_PORT,
+                image_pull_secret=AWSEnvironment._docker_secret_name,
             )
+        _t_created = _time.monotonic()
+
+        # Wait until the pod is Running (image pulled, container ready) and
+        # return its podIP. The shared PodWatcher batches all in-flight waiters
+        # onto a single K8s watch stream, so this is O(1) apiserver load
+        # regardless of how many trials are in flight at once.
+        try:
+            pod_ip = await pods.wait_for_pod_ready(self._k8s_api, self._aws_config, self._pod_name)
         except Exception as e:
-            self.logger.error("[start] wait_for_pod_running FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
+            self.logger.error("[start] wait_for_pod_ready FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
             raise
         _t_running = _time.monotonic()
 
-        if _LAYER3_ENABLED:
-            # Layer 3: read pod IP, then ask the in-cluster control server to
-            # dial the runner over direct in-VPC TCP. The apiserver is NOT in
-            # the data path. We share ONE aiohttp ClientSession across every
-            # RemoteShell so we have a single bounded connection pool to the NLB
-            # instead of 2500 separate per-trial pools.
-            from harbor_aws.core.remote_shell import RemoteShell
-            pod_ip = await pods.get_pod_ip(self._k8s_api, self._aws_config.namespace, self._pod_name)
-            shared_session = await AWSEnvironment._get_shared_aiohttp_session()
-            self._shell = RemoteShell(
-                trial_id=self._pod_name,
-                pod_ip=pod_ip,
-                pod_port=_LAYER3_RUNNER_PORT,
-                token=trial_token,
-                control_url=_LAYER3_CONTROL_URL,
-                admin_token=_LAYER3_ADMIN_TOKEN,
-                session=shared_session,
-            )
-            await self._shell.connect()
-        else:
-            # Layer 2 (v4): persistent kubectl-exec WebSocket.
-            from harbor_aws.core.shell import PersistentShell
-            self._shell = PersistentShell(self._pod_name, self._aws_config.namespace)
-            async with self._get_connect_semaphore():
-                await self._shell.connect()
+        # Ask the in-cluster control server to dial the runner over direct
+        # in-VPC TCP. The apiserver is not in the data path. ONE shared aiohttp
+        # session is used across every RemoteShell so we have a single bounded
+        # connection pool to the NLB.
+        shared_session = await AWSEnvironment._get_shared_aiohttp_session()
+        self._shell = RemoteShell(
+            trial_id=self._pod_name,
+            pod_ip=pod_ip,
+            pod_port=_RUNNER_PORT,
+            token=trial_token,
+            control_url=_CONTROL_URL,
+            admin_token=_ADMIN_TOKEN,
+            session=shared_session,
+        )
+        await self._shell.connect()
         _t_shell = _time.monotonic()
 
-        self.logger.info(
-            "[timing] %s init=%.1f image=%.1f pull_wait=%.1f create=%.1f pulled=%.1f running=%.1f shell=%.1f",
-            self.environment_name,
-            _t_init - _t0, _t_image - _t_init, _t_pull_enter - _t_image,
-            _t_created - _t_pull_enter, _t_pulled - _t_created, _t_running - _t_pulled,
-            _t_shell - _t_running,
+        # Run any inline Dockerfile setup commands plus mkdir for the harbor log dirs.
+        for i, cmd in enumerate(dockerfile_commands):
+            self.logger.debug("[start] Dockerfile cmd %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
+            try:
+                result = await self.exec(cmd, timeout_sec=300)
+            except Exception as e:
+                self.logger.error("[start] Dockerfile cmd %d FAILED for %s: %s: %s", i + 1, self._pod_name, type(e).__name__, str(e)[:200])
+                raise
+            if result.return_code != 0:
+                self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
+
+        mkdir_result = await self.exec(
+            f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir} {EnvironmentPaths.artifacts_dir}"
         )
-
-        # Setup — all commands go through the persistent shell, no new WebSocket connections.
-        _t_setup_wait = _time.monotonic()
-        async with self._get_setup_semaphore():
-            _t_setup_enter = _time.monotonic()
-            for i, cmd in enumerate(dockerfile_commands):
-                self.logger.debug("[start] Dockerfile cmd %d/%d: %s", i + 1, len(dockerfile_commands), cmd[:80])
-                try:
-                    result = await self.exec(cmd, timeout_sec=300)
-                except Exception as e:
-                    self.logger.error("[start] Dockerfile cmd %d FAILED for %s: %s: %s", i + 1, self._pod_name, type(e).__name__, str(e)[:200])
-                    raise
-                if result.return_code != 0:
-                    self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
-
-            mkdir_result = await self.exec(f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir} {EnvironmentPaths.artifacts_dir}")
-            if mkdir_result.return_code != 0:
-                raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
+        if mkdir_result.return_code != 0:
+            raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
         _t_done = _time.monotonic()
 
         self.logger.info(
-            "[timing] %s setup_wait=%.1f setup_exec=%.1f TOTAL=%.1f",
+            "[timing] %s init=%.1f image=%.1f create=%.1f running=%.1f shell=%.1f setup=%.1f TOTAL=%.1f",
             self.environment_name,
-            _t_setup_enter - _t_setup_wait, _t_done - _t_setup_enter, _t_done - _t0,
+            _t_init - _t0, _t_image - _t_init,
+            _t_created - _t_pull_enter, _t_running - _t_created,
+            _t_shell - _t_running, _t_done - _t_shell, _t_done - _t0,
         )
 
     async def stop(self, delete: bool) -> None:
@@ -558,66 +513,32 @@ class AWSEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        """Execute a command in the pod via persistent shell."""
-        if not self._pod_name:
+        """Execute a command in the pod via the persistent shell."""
+        if self._shell is None:
             raise RuntimeError("Pod not running. Call start() first.")
-
         if user is not None:
             command = f"su - {user} -c {command!r}" if isinstance(user, str) else f"su - $(id -un {user}) -c {command!r}"
-
-        if self._shell:
-            stdout, stderr, return_code = await self._shell.run(
-                command, cwd=cwd, env=env, timeout_sec=timeout_sec or 300,
-            )
-        else:
-            # Fallback to per-call WebSocket if shell not available
-            stdout, stderr, return_code = await exec.exec_command(
-                api=self._k8s_api,
-                pod_name=self._pod_name,
-                namespace=self._aws_config.namespace,
-                command=command,
-                cwd=cwd,
-                env=env,
-                timeout_sec=timeout_sec,
-            )
-
+        stdout, stderr, return_code = await self._shell.run(
+            command, cwd=cwd, env=env, timeout_sec=timeout_sec or 300,
+        )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await files.upload_file(self._pod_name, self._aws_config.namespace, str(source_path), target_path)
+        if self._shell is None:
+            raise RuntimeError("Pod not running. Call start() first.")
+        await self._shell.upload_file(source_path, target_path)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await files.upload_dir(self._pod_name, self._aws_config.namespace, str(source_dir), target_dir)
+        if self._shell is None:
+            raise RuntimeError("Pod not running. Call start() first.")
+        await self._shell.upload_dir(source_dir, target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        if self._shell:
-            import base64, io, tarfile
-            target = Path(target_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            src = Path(source_path)
-            stdout, _, rc = await self._shell.run(
-                f"tar czf - -C {src.parent} {src.name} | base64", timeout_sec=120,
-            )
-            if rc != 0 or not stdout.strip():
-                raise RuntimeError(f"download_file failed (rc={rc})")
-            data = base64.b64decode(stdout)
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
-                target.write_bytes(tar.extractfile(tar.getmembers()[0]).read())
-        else:
-            await files.download_file(self._pod_name, self._aws_config.namespace, source_path, str(target_path))
+        if self._shell is None:
+            raise RuntimeError("Pod not running. Call start() first.")
+        await self._shell.download_file(source_path, target_path)
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        if self._shell:
-            import base64, io, tarfile
-            target = Path(target_dir)
-            target.mkdir(parents=True, exist_ok=True)
-            stdout, _, rc = await self._shell.run(
-                f"tar czf - -C {source_dir} . | base64", timeout_sec=120,
-            )
-            if rc != 0 or not stdout.strip():
-                raise RuntimeError(f"download_dir failed (rc={rc})")
-            data = base64.b64decode(stdout)
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
-                tar.extractall(path=str(target), filter="data")
-        else:
-            await files.download_dir(self._pod_name, self._aws_config.namespace, source_dir, str(target_dir))
+        if self._shell is None:
+            raise RuntimeError("Pod not running. Call start() first.")
+        await self._shell.download_dir(source_dir, target_dir)

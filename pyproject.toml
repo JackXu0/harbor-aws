@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harbor-aws"
-version = "0.2.1"
+version = "0.3.0"
 description = "AWS EKS/Fargate execution backend for Harbor benchmarks"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.10.0",
     "boto3>=1.35.0",
     "harbor>=0.1.43",
     "kubernetes>=31.0.0",
@@ -39,7 +40,7 @@ packages = ["src/harbor_aws"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "N", "UP", "W"]
@@ -49,7 +50,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
