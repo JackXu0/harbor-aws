@@ -7,7 +7,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import secrets
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +22,15 @@ from kubernetes import client
 
 from harbor_aws.core import exec, files, pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
+
+# Layer 3 mode: trial pods run a TCP server (runner.py) and the harbor-control
+# in-cluster gateway dials in. Mac talks to control server via HTTP. The
+# kubectl-exec WebSocket path is bypassed entirely.
+_LAYER3_ENABLED = os.environ.get("HARBOR_LAYER3", "").lower() in ("1", "true", "yes")
+_LAYER3_CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "http://localhost:8443")
+_LAYER3_ADMIN_TOKEN = os.environ.get("HARBOR_ADMIN_TOKEN", "")
+_LAYER3_RUNNER_CONFIGMAP = os.environ.get("HARBOR_RUNNER_CONFIGMAP", "harbor-runner")
+_LAYER3_RUNNER_PORT = int(os.environ.get("HARBOR_RUNNER_PORT", "8765"))
 
 # Fargate resource profiles for known benchmark images.
 # Matched top-to-bottom by regex against the docker image URI.
@@ -52,6 +63,11 @@ class AWSEnvironment(BaseEnvironment):
     _docker_secret_name: str | None = None
     _setup_semaphore: asyncio.Semaphore | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
+    # Layer 3: ONE shared aiohttp session across all RemoteShells in this process,
+    # so we have a single bounded connection pool to the harbor-control NLB instead
+    # of 2500 separate per-trial pools (which exhaust local FDs / NLB capacity).
+    _shared_aiohttp_session: object | None = None  # aiohttp.ClientSession when set
+    _shared_aiohttp_lock: asyncio.Lock | None = None
 
     def __init__(
         self,
@@ -181,6 +197,24 @@ class AWSEnvironment(BaseEnvironment):
         if cls._connect_semaphore is None:
             cls._connect_semaphore = asyncio.Semaphore(cls._CONNECT_SEMAPHORE_LIMIT)
         return cls._connect_semaphore
+
+    @classmethod
+    async def _get_shared_aiohttp_session(cls):  # noqa: ANN206 — aiohttp imported lazily
+        """Lazily create one process-wide aiohttp ClientSession for talking to the
+        harbor-control server. All RemoteShells share it so we have one bounded
+        connection pool instead of 2500 separate per-trial pools.
+        """
+        import aiohttp
+        if cls._shared_aiohttp_lock is None:
+            cls._shared_aiohttp_lock = asyncio.Lock()
+        async with cls._shared_aiohttp_lock:
+            if cls._shared_aiohttp_session is None:
+                # Generous-but-bounded pool. limit caps total simultaneous
+                # connections; limit_per_host caps connections to a single host
+                # (the NLB DNS, which is what we're talking to).
+                connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
+                cls._shared_aiohttp_session = aiohttp.ClientSession(connector=connector)
+        return cls._shared_aiohttp_session
 
     # -- Docker Hub credentials --------------------------------------------
 
@@ -387,19 +421,37 @@ class AWSEnvironment(BaseEnvironment):
         pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
         pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
 
+        # Per-trial token for Layer 3 (no-op in Layer 2 path)
+        trial_token = secrets.token_urlsafe(16) if _LAYER3_ENABLED else ""
+
         # Throttle pod creation to avoid K8s API contention.
         async with self._get_create_semaphore():
             _t_pull_enter = _time.monotonic()
-            self._pod_name = await pods.create_pod(
-                self._k8s_api,
-                self._aws_config,
-                image_uri,
-                self.environment_name,
-                self.session_id,
-                cpus=pod_cpus,
-                memory_mb=pod_memory,
-                image_pull_secret=AWSEnvironment._docker_secret_name,
-            )
+            if _LAYER3_ENABLED:
+                self._pod_name = await pods.create_layer3_pod(
+                    self._k8s_api,
+                    self._aws_config,
+                    image_uri,
+                    self.environment_name,
+                    self.session_id,
+                    cpus=pod_cpus,
+                    memory_mb=pod_memory,
+                    trial_token=trial_token,
+                    runner_configmap=_LAYER3_RUNNER_CONFIGMAP,
+                    runner_port=_LAYER3_RUNNER_PORT,
+                    image_pull_secret=AWSEnvironment._docker_secret_name,
+                )
+            else:
+                self._pod_name = await pods.create_pod(
+                    self._k8s_api,
+                    self._aws_config,
+                    image_uri,
+                    self.environment_name,
+                    self.session_id,
+                    cpus=pod_cpus,
+                    memory_mb=pod_memory,
+                    image_pull_secret=AWSEnvironment._docker_secret_name,
+                )
         _t_created = _time.monotonic()
 
         # Wait for Fargate to pull image — no semaphore, all concurrent.
@@ -421,14 +473,31 @@ class AWSEnvironment(BaseEnvironment):
             raise
         _t_running = _time.monotonic()
 
-        # Open persistent shell — one WebSocket per pod, reused for all exec calls.
-        # Cap concurrent WebSocket exec handshakes; the K8s apiserver returns
-        # 500 "tls: internal error" when too many simultaneous dials to fresh
-        # Fargate kubelets are in flight.
-        from harbor_aws.core.shell import PersistentShell
-        self._shell = PersistentShell(self._pod_name, self._aws_config.namespace)
-        async with self._get_connect_semaphore():
+        if _LAYER3_ENABLED:
+            # Layer 3: read pod IP, then ask the in-cluster control server to
+            # dial the runner over direct in-VPC TCP. The apiserver is NOT in
+            # the data path. We share ONE aiohttp ClientSession across every
+            # RemoteShell so we have a single bounded connection pool to the NLB
+            # instead of 2500 separate per-trial pools.
+            from harbor_aws.core.remote_shell import RemoteShell
+            pod_ip = await pods.get_pod_ip(self._k8s_api, self._aws_config.namespace, self._pod_name)
+            shared_session = await AWSEnvironment._get_shared_aiohttp_session()
+            self._shell = RemoteShell(
+                trial_id=self._pod_name,
+                pod_ip=pod_ip,
+                pod_port=_LAYER3_RUNNER_PORT,
+                token=trial_token,
+                control_url=_LAYER3_CONTROL_URL,
+                admin_token=_LAYER3_ADMIN_TOKEN,
+                session=shared_session,
+            )
             await self._shell.connect()
+        else:
+            # Layer 2 (v4): persistent kubectl-exec WebSocket.
+            from harbor_aws.core.shell import PersistentShell
+            self._shell = PersistentShell(self._pod_name, self._aws_config.namespace)
+            async with self._get_connect_semaphore():
+                await self._shell.connect()
         _t_shell = _time.monotonic()
 
         self.logger.info(

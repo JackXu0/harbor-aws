@@ -1,33 +1,41 @@
-"""harbor-aws pod runner — outbound HTTP long-poll to the control server.
+"""harbor-aws pod runner — TCP server, dial-in from control server.
 
-Runs as PID 1 inside a Fargate pod. Connects out to a harbor-aws control server,
-reads commands via long-poll, executes them in a long-lived bash subprocess, and
-posts results back. Replaces the kubectl-exec / WebSocket path entirely.
+Runs as PID 1 inside a Fargate pod. Listens on a TCP port. The harbor-control
+server (which lives in the same VPC) opens a connection in, authenticates,
+then pumps commands one at a time. The runner pipes each command into a
+long-lived bash subprocess and writes the result back.
 
-Pure stdlib — no pip-installable dependencies. Will run inside any base image
-that has Python 3.8+ available.
+This replaces the kubectl-exec / apiserver-proxy path entirely:
+  - kubectl create_pod      — apiserver call by harbor (cheap, reliable)
+  - control_server -> pod   — direct in-VPC TCP, no apiserver involvement
+  - kubectl delete_pod      — apiserver call by harbor (cheap, reliable)
 
-Wire protocol:
-  POST {url}/register
-       body: {"session_id": "...", "token": "..."}
-       resp: {"ok": true}
+Pure stdlib (no pip-installable dependencies) so the runner can run inside
+any base image that has Python 3.8+. The harbor-aws adapter ships this file
+into the pod via a ConfigMap volume mount.
 
-  GET  {url}/next-command/{session_id}?token=...
-       (long poll, resp: 200 with {"id": "...", "cmd": "...",
-        "cwd": "...", "env": {...}, "timeout_sec": N}
-        or 204 No Content on idle timeout — pod just polls again)
+Wire protocol — length-prefixed JSON over the TCP socket:
 
-  POST {url}/result/{session_id}/{cmd_id}?token=...
-       body: {"stdout": "...", "stderr": "...", "rc": N}
-       resp: {"ok": true}
+  Each frame is exactly 4 bytes of big-endian length followed by that many
+  bytes of UTF-8 JSON. Length-prefixing avoids any ambiguity around stdout
+  containing newlines or other delimiters.
 
-  POST {url}/exit/{session_id}?token=...
-       (best-effort, fired in the SIGTERM handler)
+  Frame types:
+    {"type": "auth", "token": "..."}        (control -> runner, first frame)
+    {"type": "auth_ok"}                     (runner -> control)
+    {"type": "auth_fail", "reason": "..."}  (runner -> control, then close)
+    {"type": "exec", "id": "...", "cmd": "...", "cwd": null,
+     "env": {...}, "timeout_sec": 300}      (control -> runner)
+    {"type": "result", "id": "...", "stdout": "...", "stderr": "...",
+     "rc": N}                               (runner -> control)
+    {"type": "shutdown"}                    (control -> runner, optional)
+    {"type": "ping"}                        (control -> runner, idle keepalive)
+    {"type": "pong"}                        (runner -> control)
 
 Env vars (set by harbor-aws when creating the pod):
-  HARBOR_CONTROL_URL    e.g. https://harbor-control.example.com
-  HARBOR_SESSION_ID     unique session id matching the trial
-  HARBOR_TOKEN          shared secret for this session
+  HARBOR_TOKEN          shared secret. The control server must present this
+                        in its first 'auth' frame.
+  HARBOR_LISTEN_PORT    optional, defaults to 8765
 """
 
 from __future__ import annotations
@@ -35,31 +43,23 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 
 # --- config from env ---------------------------------------------------------
 
-CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "").rstrip("/")
-SESSION_ID = os.environ.get("HARBOR_SESSION_ID", "")
 TOKEN = os.environ.get("HARBOR_TOKEN", "")
+LISTEN_PORT = int(os.environ.get("HARBOR_LISTEN_PORT", "8765"))
+LISTEN_HOST = "0.0.0.0"  # noqa: S104 — must be reachable from the control server
 
-if not CONTROL_URL or not SESSION_ID or not TOKEN:
-    sys.stderr.write(
-        "harbor-runner: missing required env (HARBOR_CONTROL_URL, "
-        "HARBOR_SESSION_ID, HARBOR_TOKEN)\n"
-    )
+if not TOKEN:
+    sys.stderr.write("harbor-runner: missing HARBOR_TOKEN env\n")
     sys.exit(2)
 
-REGISTER_RETRY_INITIAL = 1.0
-REGISTER_RETRY_MAX = 30.0
-LONG_POLL_TIMEOUT_SEC = 30  # how long the server holds the GET open
-HTTP_TIMEOUT_SEC = LONG_POLL_TIMEOUT_SEC + 5
 
 # --- bash session ------------------------------------------------------------
 
@@ -78,7 +78,6 @@ class BashSession:
             bufsize=0,  # unbuffered — we read byte-by-byte
             text=False,
         )
-        # Sanity: bash is alive
         if self._proc.poll() is not None:
             raise RuntimeError("bash exited immediately")
 
@@ -118,8 +117,6 @@ class BashSession:
         err_done = False
         rc = 1
 
-        # We can't easily do select() on Popen pipes portably without nonblocking I/O.
-        # Use os.read with O_NONBLOCK on the underlying fds.
         import fcntl
 
         for stream in (self._proc.stdout, self._proc.stderr):
@@ -151,31 +148,22 @@ class BashSession:
                 pass
 
             if not out_done and end_token_b in stdout_buf:
-                # Find the line with the token + rc
                 idx = stdout_buf.find(end_token_b)
-                # The rc line looks like "__HEND_xxx__ 0\n"
                 eol = stdout_buf.find(b"\n", idx)
-                if eol == -1:
-                    # Token found but newline not yet — wait for more bytes
-                    pass
-                else:
+                if eol != -1:
                     line = stdout_buf[idx:eol]
                     parts2 = line.decode("utf-8", errors="replace").split()
                     try:
                         rc = int(parts2[-1])
                     except (ValueError, IndexError):
                         rc = 1
-                    stdout_out = stdout_buf[:idx].rstrip(b"\n")
-                    stdout_buf = stdout_out
+                    stdout_buf = stdout_buf[:idx].rstrip(b"\n")
                     out_done = True
             if not err_done and end_token_b in stderr_buf:
                 idx = stderr_buf.find(end_token_b)
                 eol = stderr_buf.find(b"\n", idx)
-                if eol == -1:
-                    pass
-                else:
-                    stderr_out = stderr_buf[:idx].rstrip(b"\n")
-                    stderr_buf = stderr_out
+                if eol != -1:
+                    stderr_buf = stderr_buf[:idx].rstrip(b"\n")
                     err_done = True
 
             if not (out_done and err_done):
@@ -206,142 +194,158 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-# --- HTTP helpers ------------------------------------------------------------
+# --- length-prefixed framing -------------------------------------------------
 
 
-def _http_request(
-    method: str,
-    path: str,
-    body: dict | None = None,
-    timeout: float = HTTP_TIMEOUT_SEC,
-) -> tuple[int, bytes]:
-    url = f"{CONTROL_URL}{path}"
-    data = None
-    headers = {"User-Agent": "harbor-runner/1"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — URL is from trusted env
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read() if hasattr(e, "read") else b""
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from sock. Raises ConnectionError if the peer closed."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("peer closed connection")
+        buf.extend(chunk)
+    return bytes(buf)
 
 
-def register() -> None:
-    """Register with the control server. Retries forever with backoff."""
-    delay = REGISTER_RETRY_INITIAL
-    while True:
-        try:
-            status, body = _http_request(
-                "POST",
-                "/register",
-                {"session_id": SESSION_ID, "token": TOKEN},
-            )
-            if status == 200:
-                sys.stderr.write(f"harbor-runner: registered as {SESSION_ID}\n")
-                return
-            sys.stderr.write(
-                f"harbor-runner: register returned {status}: {body[:200]!r}; retrying in {delay:.1f}s\n"
-            )
-        except Exception as e:  # noqa: BLE001 — we want to retry on anything
-            sys.stderr.write(f"harbor-runner: register failed: {e}; retrying in {delay:.1f}s\n")
-        time.sleep(delay)
-        delay = min(delay * 1.5, REGISTER_RETRY_MAX)
+def recv_frame(sock: socket.socket) -> dict:
+    header = _recv_exact(sock, 4)
+    (length,) = struct.unpack(">I", header)
+    if length == 0 or length > 64 * 1024 * 1024:  # 64 MB hard cap
+        raise ValueError(f"invalid frame length {length}")
+    payload = _recv_exact(sock, length)
+    return json.loads(payload.decode("utf-8"))
 
 
-def long_poll_next_command() -> dict | None:
-    """Long-poll for the next command. Returns the command dict, or None on timeout."""
-    qs = urllib.parse.urlencode({"token": TOKEN})
-    try:
-        status, body = _http_request(
-            "GET", f"/next-command/{SESSION_ID}?{qs}", timeout=HTTP_TIMEOUT_SEC,
-        )
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"harbor-runner: long-poll error: {e}\n")
-        time.sleep(1.0)
-        return None
-    if status == 204:
-        return None  # idle timeout, just poll again
-    if status == 200:
-        return json.loads(body.decode("utf-8"))
-    if status == 410:
-        # Session ended — server told us to exit
-        sys.stderr.write("harbor-runner: server returned 410 (session ended), exiting\n")
-        sys.exit(0)
-    sys.stderr.write(f"harbor-runner: unexpected long-poll status {status}: {body[:200]!r}\n")
-    time.sleep(1.0)
-    return None
-
-
-def post_result(cmd_id: str, stdout: str, stderr: str, rc: int) -> None:
-    qs = urllib.parse.urlencode({"token": TOKEN})
-    try:
-        status, body = _http_request(
-            "POST",
-            f"/result/{SESSION_ID}/{cmd_id}?{qs}",
-            {"stdout": stdout, "stderr": stderr, "rc": rc},
-        )
-        if status != 200:
-            sys.stderr.write(f"harbor-runner: post_result returned {status}: {body[:200]!r}\n")
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"harbor-runner: post_result error: {e}\n")
-
-
-def post_exit() -> None:
-    qs = urllib.parse.urlencode({"token": TOKEN})
-    try:
-        _http_request("POST", f"/exit/{SESSION_ID}?{qs}")
-    except Exception:  # noqa: BLE001
-        pass
+def send_frame(sock: socket.socket, msg: dict) -> None:
+    payload = json.dumps(msg).encode("utf-8")
+    header = struct.pack(">I", len(payload))
+    sock.sendall(header + payload)
 
 
 # --- main loop ---------------------------------------------------------------
 
 
 _bash: BashSession | None = None
+_listen_sock: socket.socket | None = None
+_client_sock: socket.socket | None = None
 
 
 def _shutdown_handler(signum, frame) -> None:  # noqa: ARG001
     sys.stderr.write(f"harbor-runner: signal {signum} received, shutting down\n")
     if _bash is not None:
         _bash.close()
-    post_exit()
+    if _client_sock is not None:
+        try:
+            _client_sock.close()
+        except Exception:
+            pass
+    if _listen_sock is not None:
+        try:
+            _listen_sock.close()
+        except Exception:
+            pass
     sys.exit(0)
 
 
-def main() -> None:
+def _serve_one_client(client: socket.socket) -> None:
+    """Authenticate, then run the command loop until the client disconnects."""
     global _bash
 
-    signal.signal(signal.SIGTERM, _shutdown_handler)
-    signal.signal(signal.SIGINT, _shutdown_handler)
+    # Step 1: auth
+    try:
+        msg = recv_frame(client)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"harbor-runner: auth recv failed: {e}\n")
+        return
+    if msg.get("type") != "auth" or msg.get("token") != TOKEN:
+        try:
+            send_frame(client, {"type": "auth_fail", "reason": "bad token"})
+        except Exception:
+            pass
+        sys.stderr.write("harbor-runner: auth failed\n")
+        return
+    send_frame(client, {"type": "auth_ok"})
+    sys.stderr.write("harbor-runner: client authenticated\n")
 
-    register()
-    _bash = BashSession()
+    # Step 2: lazily start bash on first authenticated connection
+    if _bash is None:
+        _bash = BashSession()
 
-    sys.stderr.write("harbor-runner: ready, polling for commands\n")
+    # Step 3: command loop
     while True:
-        cmd_msg = long_poll_next_command()
-        if cmd_msg is None:
+        try:
+            msg = recv_frame(client)
+        except ConnectionError:
+            sys.stderr.write("harbor-runner: client disconnected\n")
+            return
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"harbor-runner: recv error: {e}\n")
+            return
+
+        mtype = msg.get("type")
+        if mtype == "ping":
+            send_frame(client, {"type": "pong"})
+            continue
+        if mtype == "shutdown":
+            sys.stderr.write("harbor-runner: shutdown requested\n")
+            return
+        if mtype != "exec":
+            sys.stderr.write(f"harbor-runner: unknown frame type {mtype!r}\n")
             continue
 
-        cmd_id = cmd_msg.get("id", "")
-        cmd = cmd_msg.get("cmd", "")
-        cwd = cmd_msg.get("cwd")
-        env = cmd_msg.get("env") or None
-        timeout_sec = int(cmd_msg.get("timeout_sec", 300))
+        cmd_id = msg.get("id", "")
+        cmd = msg.get("cmd", "")
+        cwd = msg.get("cwd")
+        env = msg.get("env") or None
+        timeout_sec = int(msg.get("timeout_sec", 300))
 
         if not cmd_id or not cmd:
-            sys.stderr.write(f"harbor-runner: malformed command message: {cmd_msg}\n")
+            sys.stderr.write(f"harbor-runner: malformed exec frame: {msg}\n")
             continue
 
         try:
             stdout, stderr, rc = _bash.run(cmd, cwd=cwd, env=env, timeout_sec=timeout_sec)
-        except Exception as e:  # noqa: BLE001 — return any error to caller
+        except Exception as e:  # noqa: BLE001
             stdout, stderr, rc = "", f"runner error: {e}", 1
 
-        post_result(cmd_id, stdout, stderr, rc)
+        try:
+            send_frame(
+                client,
+                {"type": "result", "id": cmd_id, "stdout": stdout, "stderr": stderr, "rc": rc},
+            )
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"harbor-runner: send result error: {e}\n")
+            return
+
+
+def main() -> None:
+    global _listen_sock, _client_sock
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    _listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _listen_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    _listen_sock.listen(1)
+    sys.stderr.write(f"harbor-runner: listening on {LISTEN_HOST}:{LISTEN_PORT}\n")
+
+    # Accept one client at a time. If a client disconnects we just go back to
+    # accept(); the trial controller may reconnect within the same pod.
+    while True:
+        client, addr = _listen_sock.accept()
+        _client_sock = client
+        sys.stderr.write(f"harbor-runner: accepted {addr}\n")
+        try:
+            client.settimeout(None)  # blocking reads
+            _serve_one_client(client)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+            _client_sock = None
 
 
 if __name__ == "__main__":
