@@ -1,12 +1,14 @@
 """Harbor BaseEnvironment adapter for AWS EKS/Fargate.
 
-Architecture (Layer 3, the only path on this branch):
-
-  - kubectl create_pod / delete_pod via the K8s API server
-  - Pod runs harbor_aws/runner.py as PID 1 (mounted via ConfigMap)
-  - In-cluster harbor-control server (harbor_aws/server.py) dials the runner pod
-    over direct in-VPC TCP and bridges to the Mac over an NLB
-  - All exec / file transfer goes through the control server, NEVER kubectl exec
+Layer 3 architecture:
+  - kubectl create_pod / delete_pod via the K8s API server (control plane only).
+  - Pod runs ``harbor_aws/runner.sh`` as PID 1 (mounted via ConfigMap), which
+    dials out to the in-cluster harbor-control server over in-VPC TCP.
+  - The Mac talks to harbor-control over HTTPS via an NLB, using one
+    process-wide aiohttp ClientSession (HTTP keepalive across all trials).
+  - All exec / file transfer flows Mac → NLB → control server → trial pod.
+    The K8s apiserver is **not** in the data path, and ``kubectl exec`` is
+    never used.
 """
 
 from __future__ import annotations
@@ -34,10 +36,16 @@ from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_fro
 from harbor_aws.core.remote_shell import RemoteShell
 
 # Layer 3 configuration — set by the harbor process before invoking the adapter.
+# The Mac talks to the control server over HTTPS via _CONTROL_URL (NLB).
+# The trial pods, running inside the EKS VPC, dial the control server's
+# in-cluster runner-accept port via _CONTROL_RUNNER_HOST:_CONTROL_RUNNER_PORT.
+# Default is the in-cluster ClusterIP service "harbor-control.harbor.svc"
+# which the cluster's kube-dns resolves for trial pods.
 _CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "http://localhost:8443")
 _ADMIN_TOKEN = os.environ.get("HARBOR_ADMIN_TOKEN", "")
 _RUNNER_CONFIGMAP = os.environ.get("HARBOR_RUNNER_CONFIGMAP", "harbor-runner")
-_RUNNER_PORT = int(os.environ.get("HARBOR_RUNNER_PORT", "8765"))
+_CONTROL_RUNNER_HOST = os.environ.get("HARBOR_CONTROL_RUNNER_HOST", "harbor-control.harbor.svc.cluster.local")
+_CONTROL_RUNNER_PORT = int(os.environ.get("HARBOR_CONTROL_RUNNER_PORT", "8444"))
 
 # Fargate resource profiles for known benchmark images.
 # Matched top-to-bottom by regex against the docker image URI.
@@ -58,8 +66,10 @@ def _match_resource_profile(image: str) -> tuple[int, int] | None:
 class AWSEnvironment(BaseEnvironment):
     """AWS EKS/Fargate sandbox for Harbor benchmarks.
 
-    Each sandbox runs as a Kubernetes pod on EKS Fargate. Commands execute via
-    WebSocket exec; files transfer via tar-over-exec.
+    Each sandbox is a Kubernetes pod on EKS Fargate. The pod's PID 1 is a
+    bash runner that dials the harbor-control server (in-VPC); all command
+    execution and file transfer flow through that connection. See module
+    docstring for the full data path.
     """
 
     # -- Class-level shared state (avoid repeated API calls across instances) --
@@ -69,10 +79,9 @@ class AWSEnvironment(BaseEnvironment):
     _docker_secret_checked = False
     _docker_secret_name: str | None = None
     _build_locks: dict[str, asyncio.Lock] = {}
-    # ONE shared aiohttp session across all RemoteShells in this process, so
-    # we have a single bounded connection pool to the harbor-control NLB
-    # instead of 2500 separate per-trial pools (which exhaust local FDs and
-    # NLB capacity).
+    # One process-wide aiohttp session shared across all RemoteShells, so we
+    # use a single bounded connection pool to the NLB instead of one pool
+    # per trial (which would exhaust local FDs and NLB capacity at scale).
     _shared_aiohttp_session: object | None = None  # aiohttp.ClientSession when set
     _shared_aiohttp_lock: asyncio.Lock | None = None
 
@@ -92,7 +101,6 @@ class AWSEnvironment(BaseEnvironment):
         cpus: int | None = None,
         memory_mb: int | None = None,
         pod_timeout_sec: int = 14400,
-        skip_image_check: bool = False,
         logger: logging.Logger | None = None,
         **kwargs,
     ):
@@ -117,7 +125,6 @@ class AWSEnvironment(BaseEnvironment):
         self._cpus_override = int(cpus) if cpus is not None else None
         self._memory_mb_override = int(memory_mb) if memory_mb is not None else None
         self._pod_timeout_sec = int(pod_timeout_sec)
-        self._skip_image_check = skip_image_check if isinstance(skip_image_check, bool) else str(skip_image_check).lower() == "true"
 
         self._k8s_api: client.CoreV1Api | None = None
         self._pod_name: str | None = None
@@ -193,18 +200,17 @@ class AWSEnvironment(BaseEnvironment):
 
     @classmethod
     async def _get_shared_aiohttp_session(cls):  # noqa: ANN206 — aiohttp imported lazily
-        """Lazily create one process-wide aiohttp ClientSession for talking to the
-        harbor-control server. All RemoteShells share it so we have one bounded
-        connection pool instead of 2500 separate per-trial pools.
+        """Lazily create one process-wide aiohttp ClientSession.
+
+        All RemoteShells share this session so we use a single bounded
+        connection pool to the harbor-control NLB instead of one pool per
+        trial. ``limit_per_host`` caps the per-NLB connection count.
         """
         import aiohttp
         if cls._shared_aiohttp_lock is None:
             cls._shared_aiohttp_lock = asyncio.Lock()
         async with cls._shared_aiohttp_lock:
             if cls._shared_aiohttp_session is None:
-                # Generous-but-bounded pool. limit caps total simultaneous
-                # connections; limit_per_host caps connections to a single host
-                # (the NLB DNS, which is what we're talking to).
                 connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
                 cls._shared_aiohttp_session = aiohttp.ClientSession(connector=connector)
         return cls._shared_aiohttp_session
@@ -269,14 +275,31 @@ class AWSEnvironment(BaseEnvironment):
 
         return f"{account}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
 
-    def _parse_dockerfile(self) -> tuple[str | None, list[str]]:
-        """Extract base image and RUN/WORKDIR commands from Dockerfile."""
+    # Instructions that can be replayed inside the pod after start without
+    # losing semantics. Anything not in this set forces the build path.
+    _PULL_COMPATIBLE_INSTR = frozenset({"FROM", "RUN", "WORKDIR", "ENV", "LABEL", "MAINTAINER"})
+
+    def _parse_dockerfile(self) -> tuple[str | None, list[str], bool]:
+        """Parse Dockerfile and report pull-compatibility.
+
+        Returns ``(base_image, in_pod_commands, has_build_only_instr)``:
+
+        - ``base_image``: the first ``FROM`` image, or ``None`` if no Dockerfile.
+        - ``in_pod_commands``: shell commands derived from ``RUN`` / ``WORKDIR`` /
+          ``ENV`` instructions, ready to execute inside the pod after start.
+        - ``has_build_only_instr``: ``True`` if the Dockerfile contains any
+          instruction that can't be replayed in-pod (``COPY``, ``ADD``,
+          multi-stage ``FROM``, ``ENTRYPOINT``, ``CMD``, ``USER``, etc.). When
+          this is true the caller must take the docker-build path.
+        """
         dockerfile = self.environment_dir / "Dockerfile"
         if not dockerfile.exists():
-            return None, []
+            return None, [], False
 
-        image = None
+        image: str | None = None
         commands: list[str] = []
+        has_build_only_instr = False
+        from_count = 0
 
         # Join backslash-continued lines before parsing
         raw_lines = dockerfile.read_text().splitlines()
@@ -296,47 +319,106 @@ class AWSEnvironment(BaseEnvironment):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if stripped.upper().startswith("FROM ") and image is None:
-                image = stripped.split()[1]
-            elif stripped.upper().startswith("RUN "):
+            instr = stripped.split(maxsplit=1)[0].upper()
+
+            if instr == "FROM":
+                from_count += 1
+                if from_count > 1:
+                    # Multi-stage build → can't replay in pod.
+                    has_build_only_instr = True
+                elif image is None:
+                    image = stripped.split()[1]
+            elif instr == "RUN":
                 commands.append(stripped[4:].strip())
-            elif stripped.upper().startswith("WORKDIR "):
+            elif instr == "WORKDIR":
                 path = stripped[8:].strip()
                 commands.append(f"mkdir -p {path} && cd {path}")
+            elif instr == "ENV":
+                # Forward to in-pod env via `export`. Handles both
+                # `ENV K=V` and `ENV K V` forms.
+                rest = stripped[4:].strip()
+                if "=" in rest.split(maxsplit=1)[0]:
+                    commands.append(f"export {rest}")
+                else:
+                    parts = rest.split(maxsplit=1)
+                    if len(parts) == 2:
+                        commands.append(f"export {parts[0]}={parts[1]}")
+            elif instr in self._PULL_COMPATIBLE_INSTR:
+                # LABEL / MAINTAINER → no runtime effect, drop.
+                continue
+            else:
+                # COPY, ADD, ENTRYPOINT, CMD, USER, ARG, VOLUME, EXPOSE,
+                # HEALTHCHECK, SHELL, STOPSIGNAL, ONBUILD — none of these
+                # can be replayed in-pod with equivalent semantics.
+                has_build_only_instr = True
 
-        return image, commands
+        return image, commands, has_build_only_instr
 
-    # -- Image build & cache -----------------------------------------------
+    # -- Image resolution --------------------------------------------------
 
     _ECR_REPO = "harbor-build"
 
-    async def _get_or_build_image(self) -> str | None:
-        """Build a Docker image from the environment Dockerfile and cache it in ECR.
+    async def _resolve_image(self) -> tuple[str, list[str]]:
+        """Resolve the image to use for this trial and any in-pod setup commands.
 
-        Returns the ECR image URI if successful, None if no Dockerfile or Docker unavailable.
+        Resolution order:
+          1. ``task.toml`` ``docker_image`` field — use it as-is.
+          2. Pull-compatible Dockerfile (FROM + RUN/WORKDIR/ENV only) — pull
+             the FROM image directly and replay the RUN/WORKDIR/ENV commands
+             inside the pod after start.
+          3. Build-only Dockerfile (COPY/ADD/multi-stage/etc.) — `docker build`
+             + `docker push` to the ``harbor-build`` ECR repo. Last resort.
+
+        Returns ``(image_uri, in_pod_setup_cmds)``. The image URI is the raw
+        upstream reference; the caller is responsible for ECR-pull-through-cache
+        rewriting.
         """
+        # Tier 1: explicit override in task.toml
+        if self.task_env_config.docker_image:
+            self.logger.debug("[image] tier 1 (task.toml): %s", self.task_env_config.docker_image)
+            return self.task_env_config.docker_image, []
+
         dockerfile = self.environment_dir / "Dockerfile"
         if not dockerfile.exists():
-            return None
+            raise RuntimeError(
+                "No docker_image in task.toml and no Dockerfile found. "
+                "harbor-aws can't determine which image to run."
+            )
 
+        # Tier 2: pull-compatible Dockerfile
+        base_image, in_pod_cmds, has_build_only_instr = self._parse_dockerfile()
+        if base_image and not has_build_only_instr:
+            self.logger.debug(
+                "[image] tier 2 (pull): %s + %d in-pod setup cmds",
+                base_image, len(in_pod_cmds),
+            )
+            return base_image, in_pod_cmds
+
+        # Tier 3: real docker build
+        self.logger.info("[image] tier 3 (build): Dockerfile has build-only instructions")
+        return await self._build_image_via_docker(), []
+
+    async def _build_image_via_docker(self) -> str:
+        """Build the environment Dockerfile locally and push it to ECR.
+
+        Used only as a last resort when the Dockerfile has instructions that
+        can't be replayed inside the pod after start (COPY, ADD, multi-stage,
+        ENTRYPOINT, etc.).
+        """
+        dockerfile = self.environment_dir / "Dockerfile"
         tag = hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:16]
         account = self._aws_config.account_id
         region = self._aws_config.region
         ecr_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{self._ECR_REPO}:{tag}"
 
-        # Skip ECR check if images are known to exist (e.g., pre-cached run).
-        if self._skip_image_check:
-            self.logger.debug("Using image (skip check) %s", ecr_uri)
-            return ecr_uri
-
-        # Per-tag lock to avoid duplicate builds
+        # Per-tag lock to avoid duplicate builds when many trials share a Dockerfile
         if tag not in AWSEnvironment._build_locks:
             AWSEnvironment._build_locks[tag] = asyncio.Lock()
 
         async with AWSEnvironment._build_locks[tag]:
             async with self._get_ecr_semaphore():
                 if await asyncio.to_thread(self._ecr_image_exists, tag):
-                    self.logger.debug("Using cached image %s", ecr_uri)
+                    self.logger.debug("Using cached build %s", ecr_uri)
                     return ecr_uri
 
             self.logger.info("Building and pushing image %s", ecr_uri)
@@ -392,20 +474,7 @@ class AWSEnvironment(BaseEnvironment):
         await self._ensure_docker_pull_secret()
         _t_init = _time.monotonic()
 
-        image_uri = self.task_env_config.docker_image
-        dockerfile_commands: list[str] = []
-        if not image_uri:
-            # Try to use a pre-built image from ECR cache
-            image_uri = await self._get_or_build_image()
-            # Fall back to exec-based Dockerfile setup (no Docker available)
-            if not image_uri:
-                image_uri, dockerfile_commands = self._parse_dockerfile()
-        if not image_uri:
-            raise RuntimeError(
-                "No docker_image specified and no Dockerfile found. "
-                "harbor-aws only supports prebuilt images."
-            )
-
+        image_uri, dockerfile_commands = await self._resolve_image()
         if self._aws_config.ecr_cache:
             image_uri = self._ecr_image_uri(image_uri)
         _t_image = _time.monotonic()
@@ -414,54 +483,58 @@ class AWSEnvironment(BaseEnvironment):
         pod_cpus = self._cpus_override or (profile[0] if profile else None) or self.task_env_config.cpus
         pod_memory = self._memory_mb_override or (profile[1] if profile else None) or self.task_env_config.memory_mb
 
-        # Per-trial token used by the runner to authenticate the control server.
+        # Per-trial token used by the runner to authenticate to the control server.
         trial_token = secrets.token_urlsafe(16)
 
-        # Throttle pod creation to avoid K8s API contention.
-        async with self._get_create_semaphore():
-            _t_pull_enter = _time.monotonic()
-            self._pod_name = await pods.create_pod(
-                self._k8s_api,
-                self._aws_config,
-                image_uri,
-                self.environment_name,
-                self.session_id,
-                cpus=pod_cpus,
-                memory_mb=pod_memory,
-                trial_token=trial_token,
-                runner_configmap=_RUNNER_CONFIGMAP,
-                runner_port=_RUNNER_PORT,
-                image_pull_secret=AWSEnvironment._docker_secret_name,
-            )
-        _t_created = _time.monotonic()
-
-        # Wait until the pod is Running (image pulled, container ready) and
-        # return its podIP. The shared PodWatcher batches all in-flight waiters
-        # onto a single K8s watch stream, so this is O(1) apiserver load
-        # regardless of how many trials are in flight at once.
-        try:
-            pod_ip = await pods.wait_for_pod_ready(self._k8s_api, self._aws_config, self._pod_name)
-        except Exception as e:
-            self.logger.error("[start] wait_for_pod_ready FAILED for %s: %s: %s", self._pod_name, type(e).__name__, str(e)[:200])
-            raise
-        _t_running = _time.monotonic()
-
-        # Ask the in-cluster control server to dial the runner over direct
-        # in-VPC TCP. The apiserver is not in the data path. ONE shared aiohttp
-        # session is used across every RemoteShell so we have a single bounded
-        # connection pool to the NLB.
         shared_session = await AWSEnvironment._get_shared_aiohttp_session()
         self._shell = RemoteShell(
-            trial_id=self._pod_name,
-            pod_ip=pod_ip,
-            pod_port=_RUNNER_PORT,
+            trial_id=self.session_id,
             token=trial_token,
             control_url=_CONTROL_URL,
             admin_token=_ADMIN_TOKEN,
             session=shared_session,
         )
-        await self._shell.connect()
-        _t_shell = _time.monotonic()
+
+        # Pre-register the trial with the control server BEFORE creating the
+        # pod, so the runner has somewhere to connect to as soon as it starts.
+        # /register blocks until the runner dials in — we run it concurrently
+        # with pod creation and only await it after the pod is Running.
+        register_task = asyncio.create_task(self._shell.connect())
+
+        try:
+            # Throttle pod creation to avoid K8s API contention.
+            async with self._get_create_semaphore():
+                _t_pull_enter = _time.monotonic()
+                self._pod_name = await pods.create_pod(
+                    self._k8s_api,
+                    self._aws_config,
+                    image_uri,
+                    self.environment_name,
+                    self.session_id,
+                    cpus=pod_cpus,
+                    memory_mb=pod_memory,
+                    trial_id=self.session_id,
+                    trial_token=trial_token,
+                    runner_configmap=_RUNNER_CONFIGMAP,
+                    control_host=_CONTROL_RUNNER_HOST,
+                    control_runner_port=_CONTROL_RUNNER_PORT,
+                    image_pull_secret=AWSEnvironment._docker_secret_name,
+                )
+            _t_created = _time.monotonic()
+
+            # Wait until the pod's main container is Running. This surfaces
+            # image-pull errors quickly instead of letting /register hit its
+            # full timeout.
+            await pods.wait_for_pod_running(self._aws_config, self._pod_name)
+            _t_running = _time.monotonic()
+
+            # Now block until the runner has actually dialed in and the
+            # control server has registered the connection.
+            await register_task
+            _t_shell = _time.monotonic()
+        except Exception:
+            register_task.cancel()
+            raise
 
         # Run any inline Dockerfile setup commands plus mkdir for the harbor log dirs.
         for i, cmd in enumerate(dockerfile_commands):
@@ -475,7 +548,7 @@ class AWSEnvironment(BaseEnvironment):
                 self.logger.warning("Dockerfile setup command failed (rc=%d): %s", result.return_code, cmd[:100])
 
         mkdir_result = await self.exec(
-            f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir} {EnvironmentPaths.artifacts_dir}"
+            f"mkdir -p {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}"
         )
         if mkdir_result.return_code != 0:
             raise RuntimeError(f"Failed to create log directories: {mkdir_result.stderr}")
@@ -514,13 +587,13 @@ class AWSEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        """Execute a command in the pod via the persistent shell."""
+        """Execute a command in the pod via the harbor-control gateway."""
         if self._shell is None:
             raise RuntimeError("Pod not running. Call start() first.")
         if user is not None:
             command = f"su - {user} -c {command!r}" if isinstance(user, str) else f"su - $(id -un {user}) -c {command!r}"
         stdout, stderr, return_code = await self._shell.run(
-            command, cwd=cwd, env=env, timeout_sec=timeout_sec or 300,
+            command, cwd=cwd, env=env, timeout_sec=timeout_sec or 900,
         )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 

@@ -16,6 +16,32 @@ from harbor_aws.core.watcher import PodWatcher
 logger = logging.getLogger(__name__)
 
 
+# Bootstrap script for the pod's PID 1. Probes for bash and installs it via
+# apk on Alpine if missing (the runner needs bash for /dev/tcp). Then exec's
+# the bash runner. Uses POSIX sh so it works even on Alpine where /bin/sh is
+# busybox ash.
+_RUNNER_BOOTSTRAP_SH = r"""
+set -e
+if ! command -v bash >/dev/null 2>&1; then
+    echo "harbor-runner: bash not found, installing..." >&2
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash
+    elif command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y --quiet bash
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y --quiet bash
+    else
+        echo "harbor-runner: no bash and no known package manager" >&2
+        exit 1
+    fi
+fi
+exec bash /harbor-runner/runner.sh
+"""
+
+
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=2, max=15, jitter=3), reraise=True)
 async def create_pod(
     api: client.CoreV1Api,
@@ -25,17 +51,19 @@ async def create_pod(
     session_id: str,
     cpus: int,
     memory_mb: int,
+    trial_id: str,
     trial_token: str,
     runner_configmap: str,
-    runner_port: int,
+    control_host: str,
+    control_runner_port: int,
     image_pull_secret: str | None = None,
 ) -> str:
-    """Create a Fargate pod that runs the harbor runner.py as PID 1.
+    """Create a Fargate pod that runs the harbor runner.sh as PID 1.
 
-    The runner.py is shipped via the harbor-runner ConfigMap mounted at
-    /harbor-runner/runner.py. HARBOR_TOKEN authenticates the in-cluster
-    control server to the runner; HARBOR_LISTEN_PORT controls the runner's
-    bind port.
+    The runner.sh is shipped via the harbor-runner ConfigMap mounted at
+    /harbor-runner/runner.sh. The runner dials out to the harbor-control
+    server at control_host:control_runner_port and authenticates with
+    HARBOR_TOKEN + HARBOR_TRIAL_ID — no inbound listener on the pod.
     """
     pod_name = _make_pod_name(session_id)
     resources = {"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"}
@@ -66,13 +94,14 @@ async def create_pod(
                 client.V1Container(
                     name="main",
                     image=image_uri,
-                    command=["python3", "-u", "/harbor-runner/runner.py"],
+                    command=["sh", "-c", _RUNNER_BOOTSTRAP_SH],
                     security_context=client.V1SecurityContext(run_as_user=0),
                     env=[
                         client.V1EnvVar(name="HARBOR_TOKEN", value=trial_token),
-                        client.V1EnvVar(name="HARBOR_LISTEN_PORT", value=str(runner_port)),
+                        client.V1EnvVar(name="HARBOR_TRIAL_ID", value=trial_id),
+                        client.V1EnvVar(name="HARBOR_CONTROL_HOST", value=control_host),
+                        client.V1EnvVar(name="HARBOR_CONTROL_PORT", value=str(control_runner_port)),
                     ],
-                    ports=[client.V1ContainerPort(container_port=runner_port, name="runner")],
                     volume_mounts=[
                         client.V1VolumeMount(
                             name="harbor-runner",
@@ -102,22 +131,17 @@ async def create_pod(
     return pod_name
 
 
-async def wait_for_pod_ready(
-    api: client.CoreV1Api, config: AWSConfig, pod_name: str, timeout_sec: int = 1800,
-) -> str:
-    """Wait until the pod is Running, then return its podIP.
+async def wait_for_pod_running(
+    config: AWSConfig, pod_name: str, timeout_sec: int = 1800,
+) -> None:
+    """Wait until the pod's main container is Running.
 
-    Uses the shared PodWatcher (one watch stream per namespace, regardless of
-    how many waiters) so we don't poll the apiserver. Combines what used to be
-    wait_for_image_pulled + wait_for_pod_running + get_pod_ip into one call —
-    every L3 trial follows that exact sequence and there's no reason to
-    separate them.
+    The adapter does not need the pod IP — the runner dials the control
+    server out, identified by HARBOR_TRIAL_ID — so /register would resolve
+    on its own. We still call this to surface image-pull errors early
+    instead of waiting for the (longer) /register connect timeout.
     """
     await _wait_for_pod_event(config.namespace, pod_name, "pod_running", timeout_sec, swallow_timeout=False)
-    p = await asyncio.to_thread(api.read_namespaced_pod, name=pod_name, namespace=config.namespace)
-    if not p.status.pod_ip:
-        raise RuntimeError(f"Pod {pod_name} has no podIP yet (phase={p.status.phase})")
-    return p.status.pod_ip
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=1, max=10, jitter=2), reraise=True)
@@ -148,7 +172,7 @@ async def list_pods(api: client.CoreV1Api, config: AWSConfig) -> list[str]:
 async def _wait_for_pod_event(
     namespace: str, pod_name: str, event: str, timeout_sec: int, *, swallow_timeout: bool,
 ) -> None:
-    """Wait for a pod watcher event (image_pulled or pod_running)."""
+    """Wait for a pod watcher event (currently only ``pod_running``)."""
     logger.debug("Waiting for %s on pod %s...", event, pod_name)
     watcher = await PodWatcher.get_or_create(namespace)
     handle = watcher.register(pod_name)
@@ -168,14 +192,13 @@ async def _wait_for_pod_event(
 
 
 def _make_pod_name(session_id: str) -> str:
-    """Create a valid Kubernetes pod name from a session ID.
+    """Build a Kubernetes pod name from a session id.
 
-    Appends a short random suffix so retry attempts of the same trial create
-    distinct pods. This avoids racing the slow async deletion of the previous
-    attempt's pod, which used to surface as 'Pod was deleted' errors on the
-    new attempt's wait_for_image_pulled.
+    A 6-char random suffix lets retry attempts of the same trial create
+    distinct pods, avoiding races with the async deletion of the previous
+    attempt's pod.
     """
     suffix = uuid.uuid4().hex[:6]
-    # Reserve 3 chars for "hb-" prefix and 7 for "-{suffix}" → 53 left for the slug.
+    # 3 chars for "hb-" prefix + 7 chars for "-{suffix}" → 53 left for the slug.
     name = re.sub(r"[^a-z0-9-]", "-", session_id.lower())[:53].strip("-")
     return f"hb-{name}-{suffix}"

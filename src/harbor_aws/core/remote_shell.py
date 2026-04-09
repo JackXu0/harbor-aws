@@ -32,19 +32,15 @@ class RemoteShell:
     def __init__(
         self,
         trial_id: str,
-        pod_ip: str,
         token: str,
         control_url: str,
         admin_token: str,
-        pod_port: int = 8765,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._trial_id = trial_id
-        self._pod_ip = pod_ip
         self._token = token
         self._control_url = control_url.rstrip("/")
         self._admin_token = admin_token
-        self._pod_port = pod_port
         self._session = session
         self._owns_session = session is None
         self._closed = False
@@ -61,18 +57,30 @@ class RemoteShell:
 
     # --- lifecycle ---
 
-    async def connect(self) -> None:
-        """Tell the control server to dial the runner pod and authenticate."""
+    async def connect(self, connect_timeout: float = 600.0) -> None:
+        """Pre-register the trial with the control server.
+
+        With the reverse-runner architecture this call returns once the runner
+        pod has dialed in to the control server and authenticated. The control
+        server will block up to ``connect_timeout`` seconds waiting for that.
+
+        Default 600 s gives heavy ML base images (PyTorch, HuggingFace, etc.)
+        room to pull from Docker Hub on cold caches — observed pulls in the
+        wild can take 4-7 minutes.
+        """
         s = await self._ensure_session()
         async with s.post(
             f"{self._control_url}/register",
             json={
                 "trial_id": self._trial_id,
-                "pod_ip": self._pod_ip,
-                "pod_port": self._pod_port,
                 "token": self._token,
+                "connect_timeout": connect_timeout,
             },
             headers=self._headers,
+            # Give the HTTP request itself a bit more than connect_timeout so
+            # we always see the server's structured 504 instead of an aiohttp
+            # client-side timeout.
+            timeout=aiohttp.ClientTimeout(total=connect_timeout + 30),
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
