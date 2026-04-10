@@ -141,7 +141,16 @@ async def wait_for_pod_running(
     on its own. We still call this to surface image-pull errors early
     instead of waiting for the (longer) /register connect timeout.
     """
-    await _wait_for_pod_event(config.namespace, pod_name, "pod_running", timeout_sec, swallow_timeout=False)
+    logger.debug("Waiting for pod %s to be running...", pod_name)
+    watcher = await PodWatcher.get_or_create(config.namespace)
+    handle = watcher.register(pod_name)
+    try:
+        await asyncio.wait_for(handle.pod_running.wait(), timeout=timeout_sec)
+    except TimeoutError:
+        raise RuntimeError(f"Pod {pod_name} did not become Running in {timeout_sec}s") from None
+    if handle.error:
+        raise handle.error
+    logger.debug("Pod %s is running", pod_name)
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=1, max=10, jitter=2), reraise=True)
@@ -167,28 +176,6 @@ async def list_pods(api: client.CoreV1Api, config: AWSConfig) -> list[str]:
 
 
 # --- helpers ---
-
-
-async def _wait_for_pod_event(
-    namespace: str, pod_name: str, event: str, timeout_sec: int, *, swallow_timeout: bool,
-) -> None:
-    """Wait for a pod watcher event (currently only ``pod_running``)."""
-    logger.debug("Waiting for %s on pod %s...", event, pod_name)
-    watcher = await PodWatcher.get_or_create(namespace)
-    handle = watcher.register(pod_name)
-
-    try:
-        await asyncio.wait_for(getattr(handle, event).wait(), timeout=timeout_sec)
-    except TimeoutError:
-        if not swallow_timeout:
-            raise RuntimeError(f"Pod {pod_name} {event} timed out after {timeout_sec}s") from None
-        logger.debug("Pod %s %s timed out after %ds — continuing", pod_name, event, timeout_sec)
-        return
-
-    if handle.error:
-        raise handle.error
-
-    logger.debug("Pod %s %s complete", pod_name, event)
 
 
 def _make_pod_name(session_id: str) -> str:

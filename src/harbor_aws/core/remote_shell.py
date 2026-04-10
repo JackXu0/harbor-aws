@@ -144,16 +144,22 @@ class RemoteShell:
     # roughly 48 MB of payload per call. For larger transfers we'd need to
     # chunk, which we don't currently need for any harbor workload.
 
+    @staticmethod
+    def _tar_b64(entries: list[tuple[Path, str]]) -> str:
+        """Build a gzip+base64 tar containing ``entries`` (path, arcname pairs)."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path, arcname in entries:
+                tar.add(str(path), arcname=arcname)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
     async def upload_file(self, local_path: str | Path, remote_path: str) -> None:
         local = Path(local_path)
         if not local.exists():
             raise FileNotFoundError(local)
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            tar.add(str(local), arcname=local.name)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        # Drop the file at remote_path. The tar contains a single entry named local.name,
-        # so we extract into the parent dir of remote_path then move to the final name.
+        b64 = self._tar_b64([(local, local.name)])
+        # Extract into the parent dir of remote_path then mv to the final name,
+        # since the tar contains a single entry named local.name.
         remote = Path(remote_path)
         cmd = (
             f"mkdir -p {_q(str(remote.parent))} && "
@@ -168,11 +174,7 @@ class RemoteShell:
         local = Path(local_dir)
         if not local.is_dir():
             raise NotADirectoryError(local)
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for entry in local.iterdir():
-                tar.add(str(entry), arcname=entry.name)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        b64 = self._tar_b64([(entry, entry.name) for entry in local.iterdir()])
         cmd = (
             f"mkdir -p {_q(remote_dir)} && "
             f"echo {_q(b64)} | base64 -d | tar xzf - -C {_q(remote_dir)}"

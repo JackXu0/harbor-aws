@@ -202,16 +202,19 @@ class AWSEnvironment(BaseEnvironment):
     async def _get_shared_aiohttp_session(cls):  # noqa: ANN206 — aiohttp imported lazily
         """Lazily create one process-wide aiohttp ClientSession.
 
-        All RemoteShells share this session so we use a single bounded
-        connection pool to the harbor-control NLB instead of one pool per
-        trial. ``limit_per_host`` caps the per-NLB connection count.
+        All RemoteShells share this session so we use a single connection
+        pool to the harbor-control NLB instead of one pool per trial. The
+        pool is **unbounded** (limit=0) so workloads with thousands of
+        concurrent trials don't queue waiting for a free slot. The
+        underlying TCP cost scales with concurrent in-flight requests, not
+        with peak trial count.
         """
         import aiohttp
         if cls._shared_aiohttp_lock is None:
             cls._shared_aiohttp_lock = asyncio.Lock()
         async with cls._shared_aiohttp_lock:
             if cls._shared_aiohttp_session is None:
-                connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
+                connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
                 cls._shared_aiohttp_session = aiohttp.ClientSession(connector=connector)
         return cls._shared_aiohttp_session
 
@@ -260,7 +263,9 @@ class AWSEnvironment(BaseEnvironment):
         """
         stripped = re.sub(r"^(docker\.io|registry-1\.docker\.io)/", "", image)
 
-        if re.match(r"^[\w.-]+\.amazonaws\.com/", stripped) or re.match(r"^[\w.-]+\.\w{2,}/", stripped):
+        # Any `host.tld/...` prefix means the image already has an explicit
+        # registry — don't rewrite it. (This covers ECR, GHCR, etc. as well.)
+        if re.match(r"^[\w.-]+\.\w{2,}/", stripped):
             return image
 
         if "/" not in stripped.split(":")[0]:
@@ -587,11 +592,17 @@ class AWSEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        """Execute a command in the pod via the harbor-control gateway."""
+        """Execute a command in the pod via the harbor-control gateway.
+
+        ``user`` is part of the ``BaseEnvironment`` interface but not
+        supported here — trial pods run as root, which is equivalent to any
+        user for our sandbox purposes. Raise if a caller actually asks for a
+        non-root user so we fail loudly instead of silently ignoring it.
+        """
         if self._shell is None:
             raise RuntimeError("Pod not running. Call start() first.")
         if user is not None:
-            command = f"su - {user} -c {command!r}" if isinstance(user, str) else f"su - $(id -un {user}) -c {command!r}"
+            raise NotImplementedError("AWSEnvironment.exec(user=...) is not supported")
         stdout, stderr, return_code = await self._shell.run(
             command, cwd=cwd, env=env, timeout_sec=timeout_sec or 900,
         )
