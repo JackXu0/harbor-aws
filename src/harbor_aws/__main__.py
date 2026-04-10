@@ -76,21 +76,52 @@ def _deploy(args: argparse.Namespace) -> None:
         profile_name=args.profile,
         runner_account_ids=args.runner_accounts,
     )
-    print("\nStack outputs:")
-    for key, value in sorted(outputs.items()):
-        print(f"  {key}: {value}")
+    token = outputs.get("HarborAdminToken", "")
+    cluster_name = outputs.get("EksClusterName", args.stack_name)
+    nlb_host = _wait_for_nlb(cluster_name, args.region, args.profile)
 
-    token = outputs.get("HarborAdminToken", "<see stack outputs>")
-    print("\nGet the NLB endpoint (~2 min after deploy):")
-    print("  kubectl -n harbor get svc harbor-control-nlb"
-          " -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'")
+    print("\n" + "=" * 60)
+    print("harbor-aws is ready!")
+    print("=" * 60)
+    print(f"\n  HARBOR_CONTROL_URL=http://{nlb_host}:8443")
+    print(f"  HARBOR_ADMIN_TOKEN={token}")
     print("\nRun benchmarks:")
-    print("  HARBOR_CONTROL_URL=http://<nlb-hostname>:8443 \\")
+    print(f"  HARBOR_CONTROL_URL=http://{nlb_host}:8443 \\")
     print(f"  HARBOR_ADMIN_TOKEN={token} \\")
     print("  harbor jobs start -p ./task \\")
     print("    --environment-import-path harbor_aws.adapter:AWSEnvironment \\")
-    print(f"    --ek stack_name={args.stack_name} --ek region={args.region}"
-          " --ek ecr_cache=true")
+    print(f"    --ek stack_name={args.stack_name} --ek ecr_cache=true")
+
+
+def _wait_for_nlb(
+    cluster_name: str, region: str, profile: str | None, timeout: int = 300,
+) -> str:
+    """Poll the NLB Service until an external hostname is assigned."""
+    import asyncio
+    import time
+
+    from harbor_aws.core.config import create_k8s_client, load_config_from_stack
+
+    config = asyncio.run(load_config_from_stack(
+        stack_name=cluster_name, region=region, profile_name=profile,
+    ))
+    api = create_k8s_client(config)
+
+    print("\nWaiting for NLB endpoint...")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            svc = api.read_namespaced_service("harbor-control-nlb", config.namespace)
+            ingress = svc.status.load_balancer.ingress
+            if ingress and ingress[0].hostname:
+                print(f"  NLB: {ingress[0].hostname}")
+                return ingress[0].hostname
+        except Exception:
+            pass
+        time.sleep(10)
+    print("  NLB not ready yet. Check later with:")
+    print("    kubectl -n harbor get svc harbor-control-nlb")
+    return "<nlb-pending>"
 
 
 def _status(args: argparse.Namespace) -> None:

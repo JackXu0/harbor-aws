@@ -21,32 +21,26 @@ Each trial pod runs a small **bash runner** (`runner.sh`) as PID 1 — no Python
 ## Install
 
 ```bash
-pip install harbor-aws
-
-# CDK extras (required for deploy)
 pip install "harbor-aws[cdk]"
 ```
 
 ## Quick start
 
-### 1. Deploy (one command, ~15 min)
+### 1. Deploy (~15 min, one-time)
 
 ```bash
 python -m harbor_aws deploy --region us-east-1
 ```
 
-This creates the full stack: VPC, EKS cluster, Fargate profiles, harbor-control Deployment + NLB, AWS Load Balancer Controller, runner ConfigMap — everything needed to run benchmarks.
+Creates everything: VPC, EKS, harbor-control, NLB, Load Balancer Controller. Prints `HARBOR_CONTROL_URL` and `HARBOR_ADMIN_TOKEN` when ready.
 
 ### 2. Run benchmarks
 
-```bash
-# Get the NLB endpoint (~2 min after deploy)
-kubectl -n harbor get svc harbor-control-nlb \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+Copy the env vars from deploy output:
 
-# Run
-HARBOR_CONTROL_URL=http://<nlb-hostname>:8443 \
-HARBOR_ADMIN_TOKEN=<token-from-deploy-output> \
+```bash
+HARBOR_CONTROL_URL=http://<printed-nlb-hostname>:8443 \
+HARBOR_ADMIN_TOKEN=<printed-token> \
 harbor jobs start -p ./task -a nop -n 2500 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
   --ek stack_name=harbor-aws --ek ecr_cache=true
