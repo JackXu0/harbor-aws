@@ -79,7 +79,18 @@ def _deploy(args: argparse.Namespace) -> None:
     print("\nStack outputs:")
     for key, value in sorted(outputs.items()):
         print(f"  {key}: {value}")
-    print(f"\nUse with Harbor:\n  harbor trials start -p ./task \\\n    --environment-import-path harbor_aws.adapter:AWSEnvironment \\\n    --ek stack_name={args.stack_name} --ek region={args.region}")
+
+    token = outputs.get("HarborAdminToken", "<see stack outputs>")
+    print("\nGet the NLB endpoint (~2 min after deploy):")
+    print("  kubectl -n harbor get svc harbor-control-nlb"
+          " -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'")
+    print("\nRun benchmarks:")
+    print("  HARBOR_CONTROL_URL=http://<nlb-hostname>:8443 \\")
+    print(f"  HARBOR_ADMIN_TOKEN={token} \\")
+    print("  harbor jobs start -p ./task \\")
+    print("    --environment-import-path harbor_aws.adapter:AWSEnvironment \\")
+    print(f"    --ek stack_name={args.stack_name} --ek region={args.region}"
+          " --ek ecr_cache=true")
 
 
 def _status(args: argparse.Namespace) -> None:

@@ -37,6 +37,8 @@ def _write_cdk_app(
     """Write a minimal CDK app to a temporary directory. Returns the app.py path."""
     # Resolve the src directory so the CDK app can import harbor_aws
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    # Project root for Docker build context (Dockerfile) and runner.sh
+    project_root = os.path.abspath(os.path.join(src_dir, ".."))
     runner_ids_repr = repr(runner_account_ids) if runner_account_ids else "None"
     secret_repr = repr(docker_hub_secret_arn) if docker_hub_secret_arn else "None"
     admin_repr = repr(cluster_admin_role_arn) if cluster_admin_role_arn else "None"
@@ -50,6 +52,7 @@ app = cdk.App()
 HarborAWSStack(
     app, "{stack_prefix}",
     stack_prefix="{stack_prefix}",
+    project_root="{project_root}",
     runner_account_ids={runner_ids_repr},
     docker_hub_secret_arn={secret_repr},
     cluster_admin_role_arn={admin_repr},

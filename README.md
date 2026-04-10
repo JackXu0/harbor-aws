@@ -2,76 +2,78 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Designed for high-concurrency runs (thousands of trials in parallel) without `kubectl exec` in the data path.
+AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Run thousands of sandbox trials in parallel with per-second billing and VM-level isolation.
 
-- **Pay-on-demand execution:** Cost scales with benchmark demand. Fargate per-second billing for trial pods.
-- **High-concurrency execution:** 2,400+ commands/sec sustained throughput verified at 2,492 concurrent trials.
-- **No kubectl exec data path:** Trial pods run a small bash runner (`runner.sh`) that dials the in-cluster gateway (`server.py`) over `/dev/tcp`. The gateway bridges to the orchestrator over an NLB. The K8s apiserver is only used for `create_pod` / `delete_pod`.
-- **Runs on any image with bash:** No Python needed in the trial image. The bootstrap installs `bash` via apk/apt-get/dnf/yum on minimal images that don't have it.
+## How it works
+
+```
+Orchestrator (laptop / CI)
+    |  HTTPS via NLB
+    v
+harbor-control pod (in-cluster gateway)
+    |  TCP via /dev/tcp
+    v
+Trial pods (one per task, Fargate)
+```
+
+Each trial pod runs a small **bash runner** (`runner.sh`) as PID 1 — no Python needed in the trial image. The runner dials the in-cluster **harbor-control** gateway over plain TCP. The orchestrator talks to harbor-control over an NLB. The K8s API server is only used for pod create/delete, never in the exec data path.
 
 ## Install
 
 ```bash
 pip install harbor-aws
 
-# CDK extras for `python -m harbor_aws deploy`
+# CDK extras (required for deploy)
 pip install "harbor-aws[cdk]"
 ```
 
-## Quick Start
+## Quick start
+
+### 1. Deploy (one command, ~15 min)
 
 ```bash
-# 1. Deploy your harbor-aws cluster (one-time, ~15-20 min)
 python -m harbor_aws deploy --region us-east-1
-
-# 2. Bootstrap the L3 control plane in the cluster:
-#    - Build & push the harbor-control image (Dockerfile under docker/harbor-control/)
-#    - Apply Deployment for harbor-control with two ports: 8443 (HTTPS API)
-#      and 8444 (runner accept)
-#    - Apply Service(ClusterIP) exposing both ports + Service(LoadBalancer/NLB)
-#      exposing 8443 to the orchestrator
-#    - Apply ConfigMap from src/harbor_aws/runner.sh
-#    - Install AWS Load Balancer Controller if not already there
-
-# 3. Run benchmarks
-HARBOR_CONTROL_URL=http://<harbor-control-nlb-dns>:8443 \
-HARBOR_ADMIN_TOKEN=<your-token> \
-harbor jobs start -p ./task -a nop -n 2500 \
-  --environment-import-path harbor_aws.adapter:AWSEnvironment \
-  --ek stack_name=harbor-aws \
-  --ek ecr_cache=true \
-  --disable-verification --max-retries 2
-
-# 4. Clean up
-python -m harbor_aws stop      # delete trial pods, keep infra
-python -m harbor_aws destroy   # delete everything
 ```
 
-> **Prerequisites:** AWS account with admin access. Docker Hub login (`docker login`) recommended to avoid anonymous pull rate limits when building task images.
+This creates the full stack: VPC, EKS cluster, Fargate profiles, harbor-control Deployment + NLB, AWS Load Balancer Controller, runner ConfigMap — everything needed to run benchmarks.
 
-## Validation
+### 2. Run benchmarks
 
-Benchmarks reproduced from the [Kimi K2.5 technical report](https://arxiv.org/abs/2504.05861) using Kimi K2.5 on Amazon Bedrock with [terminus-2](https://github.com/harbor-framework/terminus-2).
+```bash
+# Get the NLB endpoint (~2 min after deploy)
+kubectl -n harbor get svc harbor-control-nlb \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 
-| Benchmark | Official | harbor-aws |
-|---|:---:|:---:|
-| SWE-bench Verified | 76.8% | 71.5% |
-| Terminal-Bench 2.0 | 50.8% | 43.8% |
-| GPQA-Diamond | 87.6% | 79.8% |
-| LiveCodeBench v6 | 85.0% | 88.6% |
+# Run
+HARBOR_CONTROL_URL=http://<nlb-hostname>:8443 \
+HARBOR_ADMIN_TOKEN=<token-from-deploy-output> \
+harbor jobs start -p ./task -a nop -n 2500 \
+  --environment-import-path harbor_aws.adapter:AWSEnvironment \
+  --ek stack_name=harbor-aws --ek ecr_cache=true
+```
 
-> Score gaps are expected — official results used Kimi's internal agent for some benchmarks, while we use terminus-2 throughout.
+### 3. Clean up
 
-## Documentation
+```bash
+python -m harbor_aws stop      # delete trial pods, keep infra
+python -m harbor_aws destroy   # tear down everything
+```
 
-- [System Architecture & Design Principles](https://hammerhead-floor-229.notion.site/Harbor-AWS-System-Architecture-Design-Principles-322c2bfbdd1781b997dad4c5e54b2ee7) — architecture overview, tradeoffs, and design rationale
+## Cost
+
+| Component | Cost |
+|---|---|
+| EKS control plane | ~$73/mo (fixed) |
+| Fargate trial pods | per-second, only when running |
+| harbor-control pod | ~$5/mo (always-on) |
+| NLB | ~$16/mo |
 
 ## Development
 
 ```bash
-uv sync --extra dev --extra cdk
-uv run ruff check src/
-uv run mypy src/
+pip install -e ".[dev,cdk]"
+ruff check src/
+mypy src/
 ```
 
 ## License
