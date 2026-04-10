@@ -317,128 +317,100 @@ class AWSEnvironment(BaseEnvironment):
 
         return f"{account}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
 
-    # Instructions that can be replayed inside the pod after start without
-    # losing semantics. Anything not in this set forces the build path.
-    _PULL_COMPATIBLE_INSTR = frozenset({"FROM", "RUN", "WORKDIR", "ENV", "LABEL", "MAINTAINER"})
+    # -- Image resolution --------------------------------------------------
+    #
+    # Three tiers, tried in order:
+    #   Tier 1 — task.toml `docker_image`: use the image directly, no setup.
+    #   Tier 2 — simple Dockerfile: pull FROM image, replay RUN/WORKDIR/ENV
+    #            inside the pod as setup. Avoids `docker build` entirely.
+    #   Tier 3 — complex Dockerfile: real `docker build` + push to ECR.
 
-    def _parse_dockerfile(self) -> tuple[str | None, list[str], bool]:
-        """Parse Dockerfile and report pull-compatibility.
+    _ECR_REPO = "harbor-build"
 
-        Returns ``(base_image, in_pod_commands, has_build_only_instr)``:
+    async def _resolve_image(self) -> tuple[str, list[str]]:
+        """Return ``(image_uri, in_pod_setup_cmds)`` for this trial."""
+        # Tier 1: explicit image
+        if self.task_env_config.docker_image:
+            self.logger.debug("[image] tier 1 (task.toml): %s", self.task_env_config.docker_image)
+            return self.task_env_config.docker_image, []
 
-        - ``base_image``: the first ``FROM`` image, or ``None`` if no Dockerfile.
-        - ``in_pod_commands``: shell commands derived from ``RUN`` / ``WORKDIR`` /
-          ``ENV`` instructions, ready to execute inside the pod after start.
-        - ``has_build_only_instr``: ``True`` if the Dockerfile contains any
-          instruction that can't be replayed in-pod (``COPY``, ``ADD``,
-          multi-stage ``FROM``, ``ENTRYPOINT``, ``CMD``, ``USER``, etc.). When
-          this is true the caller must take the docker-build path.
+        if not (self.environment_dir / "Dockerfile").exists():
+            raise RuntimeError(
+                "No docker_image in task.toml and no Dockerfile found. "
+                "harbor-aws can't determine which image to run."
+            )
+
+        # Tier 2: simple Dockerfile we can replay in-pod
+        if (parsed := self._parse_simple_dockerfile()) is not None:
+            base_image, setup_cmds = parsed
+            self.logger.debug("[image] tier 2 (pull): %s + %d setup cmds", base_image, len(setup_cmds))
+            return base_image, setup_cmds
+
+        # Tier 3: real build
+        self.logger.info("[image] tier 3 (build): falling back to docker build")
+        return await self._build_image_via_docker(), []
+
+    def _parse_simple_dockerfile(self) -> tuple[str, list[str]] | None:
+        """Return ``(base_image, setup_commands)`` if the Dockerfile can be
+        replayed inside a running pod, or ``None`` if it needs ``docker build``.
+
+        Replay-compatible means: a single ``FROM`` plus only ``RUN`` /
+        ``WORKDIR`` / ``ENV`` / ``LABEL`` / ``MAINTAINER`` instructions.
+        Anything else (``COPY``, ``ADD``, multi-stage, BuildKit ``RUN --flag``,
+        ``ENTRYPOINT``, ``CMD``, ``USER``, ...) bails out to tier 3.
         """
-        dockerfile = self.environment_dir / "Dockerfile"
-        if not dockerfile.exists():
-            return None, [], False
-
         image: str | None = None
         commands: list[str] = []
-        has_build_only_instr = False
         from_count = 0
 
-        # Join backslash-continued lines before parsing
-        raw_lines = dockerfile.read_text().splitlines()
-        logical_lines: list[str] = []
-        current = ""
-        for raw in raw_lines:
-            if raw.rstrip().endswith("\\"):
-                current += raw.rstrip()[:-1]
-            else:
-                current += raw
-                logical_lines.append(current)
-                current = ""
-        if current:
-            logical_lines.append(current)
-
-        for line in logical_lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            instr = stripped.split(maxsplit=1)[0].upper()
+        for line in self._dockerfile_logical_lines():
+            instr, _, rest = line.partition(" ")
+            instr = instr.upper()
+            rest = rest.strip()
 
             if instr == "FROM":
                 from_count += 1
                 if from_count > 1:
-                    # Multi-stage build → can't replay in pod.
-                    has_build_only_instr = True
-                elif image is None:
-                    image = stripped.split()[1]
+                    return None  # multi-stage
+                image = rest.split()[0]
             elif instr == "RUN":
-                commands.append(stripped[4:].strip())
+                if rest.startswith("--"):
+                    return None  # BuildKit flag — can't replay in shell
+                commands.append(rest)
             elif instr == "WORKDIR":
-                path = stripped[8:].strip()
-                commands.append(f"mkdir -p {path} && cd {path}")
+                commands.append(f"mkdir -p {rest} && cd {rest}")
             elif instr == "ENV":
-                # Forward to in-pod env via `export`. Handles both
-                # `ENV K=V` and `ENV K V` forms.
-                rest = stripped[4:].strip()
+                # `ENV K=V` and `ENV K V` both supported
                 if "=" in rest.split(maxsplit=1)[0]:
                     commands.append(f"export {rest}")
                 else:
                     parts = rest.split(maxsplit=1)
                     if len(parts) == 2:
                         commands.append(f"export {parts[0]}={parts[1]}")
-            elif instr in self._PULL_COMPATIBLE_INSTR:
-                # LABEL / MAINTAINER → no runtime effect, drop.
-                continue
+            elif instr in {"LABEL", "MAINTAINER"}:
+                continue  # no runtime effect
             else:
-                # COPY, ADD, ENTRYPOINT, CMD, USER, ARG, VOLUME, EXPOSE,
-                # HEALTHCHECK, SHELL, STOPSIGNAL, ONBUILD — none of these
-                # can be replayed in-pod with equivalent semantics.
-                has_build_only_instr = True
+                return None  # COPY, ADD, ENTRYPOINT, CMD, USER, ARG, VOLUME, ...
 
-        return image, commands, has_build_only_instr
+        return (image, commands) if image else None
 
-    # -- Image resolution --------------------------------------------------
-
-    _ECR_REPO = "harbor-build"
-
-    async def _resolve_image(self) -> tuple[str, list[str]]:
-        """Resolve the image to use for this trial and any in-pod setup commands.
-
-        Resolution order:
-          1. ``task.toml`` ``docker_image`` field — use it as-is.
-          2. Pull-compatible Dockerfile (FROM + RUN/WORKDIR/ENV only) — pull
-             the FROM image directly and replay the RUN/WORKDIR/ENV commands
-             inside the pod after start.
-          3. Build-only Dockerfile (COPY/ADD/multi-stage/etc.) — `docker build`
-             + `docker push` to the ``harbor-build`` ECR repo. Last resort.
-
-        Returns ``(image_uri, in_pod_setup_cmds)``. The image URI is the raw
-        upstream reference; the caller is responsible for ECR-pull-through-cache
-        rewriting.
-        """
-        # Tier 1: explicit override in task.toml
-        if self.task_env_config.docker_image:
-            self.logger.debug("[image] tier 1 (task.toml): %s", self.task_env_config.docker_image)
-            return self.task_env_config.docker_image, []
-
-        dockerfile = self.environment_dir / "Dockerfile"
-        if not dockerfile.exists():
-            raise RuntimeError(
-                "No docker_image in task.toml and no Dockerfile found. "
-                "harbor-aws can't determine which image to run."
-            )
-
-        # Tier 2: pull-compatible Dockerfile
-        base_image, in_pod_cmds, has_build_only_instr = self._parse_dockerfile()
-        if base_image and not has_build_only_instr:
-            self.logger.debug(
-                "[image] tier 2 (pull): %s + %d in-pod setup cmds",
-                base_image, len(in_pod_cmds),
-            )
-            return base_image, in_pod_cmds
-
-        # Tier 3: real docker build
-        self.logger.info("[image] tier 3 (build): Dockerfile has build-only instructions")
-        return await self._build_image_via_docker(), []
+    def _dockerfile_logical_lines(self) -> list[str]:
+        """Read the Dockerfile and yield logical lines (joining ``\\``-continuations)."""
+        raw_lines = (self.environment_dir / "Dockerfile").read_text().splitlines()
+        logical: list[str] = []
+        current = ""
+        for raw in raw_lines:
+            if raw.rstrip().endswith("\\"):
+                current += raw.rstrip()[:-1]
+            else:
+                current += raw
+                stripped = current.strip()
+                if stripped and not stripped.startswith("#"):
+                    logical.append(stripped)
+                current = ""
+        if current.strip() and not current.strip().startswith("#"):
+            logical.append(current.strip())
+        return logical
 
     async def _build_image_via_docker(self) -> str:
         """Build the environment Dockerfile locally and push it to ECR.
