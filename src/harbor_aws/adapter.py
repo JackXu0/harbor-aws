@@ -35,14 +35,8 @@ from harbor_aws.core import pods
 from harbor_aws.core.config import AWSConfig, create_k8s_client, load_config_from_stack
 from harbor_aws.core.remote_shell import RemoteShell
 
-# Layer 3 configuration — set by the harbor process before invoking the adapter.
-# The Mac talks to the control server over HTTPS via _CONTROL_URL (NLB).
-# The trial pods, running inside the EKS VPC, dial the control server's
-# in-cluster runner-accept port via _CONTROL_RUNNER_HOST:_CONTROL_RUNNER_PORT.
-# Default is the in-cluster ClusterIP service "harbor-control.harbor.svc"
-# which the cluster's kube-dns resolves for trial pods.
-_CONTROL_URL = os.environ.get("HARBOR_CONTROL_URL", "http://localhost:8443")
-_ADMIN_TOKEN = os.environ.get("HARBOR_ADMIN_TOKEN", "")
+# Layer 3 configuration. Auto-discovered from the CloudFormation stack
+# and K8s API unless explicitly overridden via environment variables.
 _RUNNER_CONFIGMAP = os.environ.get("HARBOR_RUNNER_CONFIGMAP", "harbor-runner")
 _CONTROL_RUNNER_HOST = os.environ.get("HARBOR_CONTROL_RUNNER_HOST", "harbor-control.harbor.svc.cluster.local")
 _CONTROL_RUNNER_PORT = int(os.environ.get("HARBOR_CONTROL_RUNNER_PORT", "8444"))
@@ -84,6 +78,8 @@ class AWSEnvironment(BaseEnvironment):
     # per trial (which would exhaust local FDs and NLB capacity at scale).
     _shared_aiohttp_session: object | None = None  # aiohttp.ClientSession when set
     _shared_aiohttp_lock: asyncio.Lock | None = None
+    _control_url: str | None = None
+    _admin_token: str | None = None
 
     def __init__(
         self,
@@ -180,6 +176,47 @@ class AWSEnvironment(BaseEnvironment):
             if AWSEnvironment._shared_k8s_api is None:
                 AWSEnvironment._shared_k8s_api = create_k8s_client(self._aws_config)
             self._k8s_api = AWSEnvironment._shared_k8s_api
+
+    async def _ensure_control_plane(self) -> None:
+        """Resolve the harbor-control NLB URL and admin token.
+
+        Priority: env var override > stack output / K8s Service lookup.
+        """
+        cls = AWSEnvironment
+        if cls._control_url is not None:
+            return
+
+        # Env var overrides (backwards compat / manual setups)
+        env_url = os.environ.get("HARBOR_CONTROL_URL")
+        env_token = os.environ.get("HARBOR_ADMIN_TOKEN")
+        if env_url and env_token:
+            cls._control_url = env_url
+            cls._admin_token = env_token
+            return
+
+        # Admin token from stack output
+        cls._admin_token = env_token or self._aws_config.admin_token or ""
+
+        # NLB hostname from K8s Service
+        if env_url:
+            cls._control_url = env_url
+        else:
+            nlb_host = await asyncio.to_thread(
+                self._read_nlb_hostname, self._k8s_api, self._aws_config.namespace,
+            )
+            cls._control_url = f"http://{nlb_host}:8443"
+            self.logger.info("Auto-discovered control URL: %s", cls._control_url)
+
+    @staticmethod
+    def _read_nlb_hostname(api: client.CoreV1Api, namespace: str) -> str:
+        svc = api.read_namespaced_service("harbor-control-nlb", namespace)
+        ingress = svc.status.load_balancer.ingress
+        if ingress and ingress[0].hostname:
+            return ingress[0].hostname
+        raise RuntimeError(
+            "harbor-control-nlb Service has no external hostname. "
+            "Is the AWS Load Balancer Controller running?"
+        )
 
     _ECR_SEMAPHORE_LIMIT = 50
     _CREATE_SEMAPHORE_LIMIT = 100
@@ -476,6 +513,7 @@ class AWSEnvironment(BaseEnvironment):
 
         await self._ensure_config()
         self._ensure_k8s_client()
+        await self._ensure_control_plane()
         await self._ensure_docker_pull_secret()
         _t_init = _time.monotonic()
 
@@ -495,8 +533,8 @@ class AWSEnvironment(BaseEnvironment):
         self._shell = RemoteShell(
             trial_id=self.session_id,
             token=trial_token,
-            control_url=_CONTROL_URL,
-            admin_token=_ADMIN_TOKEN,
+            control_url=AWSEnvironment._control_url,
+            admin_token=AWSEnvironment._admin_token,
             session=shared_session,
         )
 

@@ -57,6 +57,10 @@ class AWSConfig:
     # Stack-based configuration
     stack_name: str | None = None
 
+    # L3 control plane (auto-discovered from stack + K8s if not set)
+    admin_token: str | None = None
+    control_url: str | None = None
+
     def validate(self) -> None:
         """Validate that required fields are set."""
         if not self.eks_cluster_name:
@@ -153,6 +157,7 @@ async def load_config_from_stack(
         namespace=outputs.get("Namespace", "harbor"),
         k8s_service_account=outputs.get("PodServiceAccount"),
         account_id=account_id,
+        admin_token=outputs.get("HarborAdminToken"),
     )
 
     config.validate()

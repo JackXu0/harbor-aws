@@ -32,19 +32,17 @@ pip install "harbor-aws[cdk]"
 python -m harbor_aws deploy --region us-east-1
 ```
 
-Creates everything: VPC, EKS, harbor-control, NLB, Load Balancer Controller. Prints `HARBOR_CONTROL_URL` and `HARBOR_ADMIN_TOKEN` when ready.
+Creates everything: VPC, EKS, harbor-control, NLB, Load Balancer Controller.
 
 ### 2. Run benchmarks
 
-Copy the env vars from deploy output:
-
 ```bash
-HARBOR_CONTROL_URL=http://<printed-nlb-hostname>:8443 \
-HARBOR_ADMIN_TOKEN=<printed-token> \
 harbor jobs start -p ./task -a nop -n 2500 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
   --ek stack_name=harbor-aws --ek ecr_cache=true
 ```
+
+The adapter auto-discovers the NLB endpoint and admin token from the stack. No env vars needed.
 
 ### 3. Clean up
 
