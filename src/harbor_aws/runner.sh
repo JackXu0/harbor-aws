@@ -43,8 +43,17 @@ b64() {
     fi
 }
 
-# Open a bidirectional TCP connection on FD 3.
-exec 3<>/dev/tcp/"$HARBOR_CONTROL_HOST"/"$HARBOR_CONTROL_PORT"
+# Open TCP connection to harbor-control. Retry on DNS / connect failures —
+# CoreDNS gets overwhelmed when thousands of pods start simultaneously.
+attempt=0
+while ! exec 3<>/dev/tcp/"$HARBOR_CONTROL_HOST"/"$HARBOR_CONTROL_PORT" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ $attempt -ge 30 ]; then
+        echo "harbor-runner: failed to connect to $HARBOR_CONTROL_HOST:$HARBOR_CONTROL_PORT after $attempt attempts" >&2
+        exit 1
+    fi
+    sleep 2
+done
 
 # Send auth frame.
 printf 'A\n%s\n%s\n' "$HARBOR_TOKEN" "$HARBOR_TRIAL_ID" >&3

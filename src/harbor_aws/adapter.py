@@ -80,6 +80,7 @@ class AWSEnvironment(BaseEnvironment):
     _shared_aiohttp_lock: asyncio.Lock | None = None
     _control_url: str | None = None
     _admin_token: str | None = None
+    _shared_ecr_client = None  # boto3 ECR client (lazy)
 
     def __init__(
         self,
@@ -430,18 +431,29 @@ class AWSEnvironment(BaseEnvironment):
             AWSEnvironment._build_locks[tag] = asyncio.Lock()
 
         async with AWSEnvironment._build_locks[tag]:
-            async with self._get_ecr_semaphore():
-                if await asyncio.to_thread(self._ecr_image_exists, tag):
-                    self.logger.debug("Using cached build %s", ecr_uri)
-                    return ecr_uri
+            # Cache hit is the common case at scale, so don't gate it on the
+            # build semaphore — that would serialize 2492 cheap describe_images
+            # calls. The build path below is the expensive part that needs
+            # throttling.
+            if await asyncio.to_thread(self._ecr_image_exists, tag):
+                self.logger.debug("Using cached build %s", ecr_uri)
+                return ecr_uri
 
-            self.logger.info("Building and pushing image %s", ecr_uri)
-            await asyncio.to_thread(self._docker_build_and_push, ecr_uri)
-            return ecr_uri
+            async with self._get_ecr_semaphore():
+                self.logger.info("Building and pushing image %s", ecr_uri)
+                await asyncio.to_thread(self._docker_build_and_push, ecr_uri)
+                return ecr_uri
+
+    @classmethod
+    def _get_ecr_client(cls, aws_config: AWSConfig):
+        """One process-wide boto3 ECR client. Avoids ~1s session+client setup per call."""
+        if cls._shared_ecr_client is None:
+            session = aws_config.create_boto3_session()
+            cls._shared_ecr_client = session.client("ecr", region_name=aws_config.region)
+        return cls._shared_ecr_client
 
     def _ecr_image_exists(self, tag: str) -> bool:
-        session = self._aws_config.create_boto3_session()
-        ecr = session.client("ecr", region_name=self._aws_config.region)
+        ecr = self._get_ecr_client(self._aws_config)
         try:
             ecr.describe_images(repositoryName=self._ECR_REPO, imageIds=[{"imageTag": tag}])
             return True
@@ -482,6 +494,10 @@ class AWSEnvironment(BaseEnvironment):
         """Start a Kubernetes pod for the benchmark task."""
         import time as _time
         _t0 = _time.monotonic()
+
+        if self._shell is not None or self._pod_name is not None:
+            self.logger.warning("start() retried for session %s; cleaning up previous attempt", self.session_id)
+            await self.stop(delete=True)
 
         await self._ensure_config()
         self._ensure_k8s_client()
