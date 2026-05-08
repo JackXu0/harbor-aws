@@ -7,7 +7,6 @@ import logging
 import os
 import subprocess
 import threading
-import time
 from dataclasses import dataclass
 
 import boto3
@@ -15,21 +14,6 @@ from kubernetes import client
 from kubernetes import config as k8s_config
 
 logger = logging.getLogger(__name__)
-
-# EKS tokens expire after 15 minutes; refresh every 10 minutes
-_TOKEN_REFRESH_INTERVAL = 600
-_kubeconfig_lock = threading.Lock()
-_kubeconfig_loaded_at: float = 0
-
-
-def ensure_fresh_kubeconfig() -> None:
-    """Reload kubeconfig if the EKS token is stale. Thread-safe."""
-    global _kubeconfig_loaded_at
-    with _kubeconfig_lock:
-        if time.monotonic() - _kubeconfig_loaded_at > _TOKEN_REFRESH_INTERVAL:
-            k8s_config.load_kube_config()
-            _kubeconfig_loaded_at = time.monotonic()
-            logger.debug("Refreshed kubeconfig token")
 
 
 @dataclass(frozen=True)
@@ -106,23 +90,23 @@ class TrialOptions:
     use_bedrock: bool = False
 
 
-_kubeconfig_setup = False
+_kubeconfig_setup_lock = threading.Lock()
+_kubeconfig_setup_done = False
 
 
 def create_k8s_client(config: ClusterConfig) -> client.CoreV1Api:
-    """Create a Kubernetes CoreV1Api client for the EKS cluster."""
-    global _kubeconfig_setup
+    global _kubeconfig_setup_done
 
-    with _kubeconfig_lock:
-        if not _kubeconfig_setup:
+    with _kubeconfig_setup_lock:
+        if not _kubeconfig_setup_done:
             cmd = ["aws", "eks", "update-kubeconfig",
                    "--name", config.eks_cluster_name, "--region", config.region]
             if config.role_arn:
                 cmd += ["--role-arn", config.role_arn]
             subprocess.run(cmd, check=True, capture_output=True, text=True, env=config._cli_env())
-            _kubeconfig_setup = True
+            k8s_config.load_kube_config()
+            _kubeconfig_setup_done = True
 
-    ensure_fresh_kubeconfig()
     cfg = client.Configuration.get_default_copy()
     cfg.connection_pool_maxsize = 500
     return client.CoreV1Api(api_client=client.ApiClient(configuration=cfg))
