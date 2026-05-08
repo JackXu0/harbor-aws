@@ -109,7 +109,7 @@ class ControlServer:
         self._host = host
         self._http_port = http_port
         self._runner_port = runner_port
-        self._admin_token = admin_token or os.environ.get("HARBOR_ADMIN_TOKEN") or secrets.token_urlsafe(32)
+        self._admin_token = admin_token or os.environ.get("HARBOR_BEARER_TOKEN") or secrets.token_urlsafe(32)
         self._app: web.Application | None = None
         self._http_runner: web.AppRunner | None = None
         self._http_site: web.TCPSite | None = None

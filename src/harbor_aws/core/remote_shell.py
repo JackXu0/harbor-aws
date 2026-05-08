@@ -1,8 +1,8 @@
-"""RemoteShell — talks to one trial pod via the harbor-control gateway.
+"""RemoteShell — talks to one trial pod via the control pod (via NLB).
 
 The adapter holds one RemoteShell per trial. All command execution and file
 transfer go through this object, which forwards everything to the in-cluster
-harbor-control server over plain HTTPS. The control server then talks to the
+control pod over plain HTTPS. The control pod then talks to the
 trial pod over direct in-VPC TCP. The K8s apiserver is not in the data path.
 
 Public interface:
@@ -27,20 +27,20 @@ import aiohttp
 
 
 class RemoteShell:
-    """Talks to one trial pod via the harbor-control gateway."""
+    """Talks to one trial pod via the control pod (via NLB)."""
 
     def __init__(
         self,
         trial_id: str,
         token: str,
-        control_url: str,
-        admin_token: str,
+        nlb_url: str,
+        bearer_token: str,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._trial_id = trial_id
         self._token = token
-        self._control_url = control_url.rstrip("/")
-        self._admin_token = admin_token
+        self._nlb_url = nlb_url.rstrip("/")
+        self._bearer_token = bearer_token
         self._session = session
         self._owns_session = session is None
         self._closed = False
@@ -53,7 +53,7 @@ class RemoteShell:
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._admin_token}"}
+        return {"Authorization": f"Bearer {self._bearer_token}"}
 
     # --- lifecycle ---
 
@@ -70,7 +70,7 @@ class RemoteShell:
         """
         s = await self._ensure_session()
         async with s.post(
-            f"{self._control_url}/register",
+            f"{self._nlb_url}/register",
             json={
                 "trial_id": self._trial_id,
                 "token": self._token,
@@ -93,7 +93,7 @@ class RemoteShell:
         try:
             s = await self._ensure_session()
             async with s.post(
-                f"{self._control_url}/stop",
+                f"{self._nlb_url}/stop",
                 json={"trial_id": self._trial_id},
                 headers=self._headers,
             ) as resp:
@@ -124,7 +124,7 @@ class RemoteShell:
             "timeout_sec": timeout_sec,
         }
         async with s.post(
-            f"{self._control_url}/exec", json=body, headers=self._headers
+            f"{self._nlb_url}/exec", json=body, headers=self._headers
         ) as resp:
             payload = await resp.json()
             if resp.status != 200:

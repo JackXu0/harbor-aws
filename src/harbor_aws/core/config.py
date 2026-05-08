@@ -32,9 +32,13 @@ def ensure_fresh_kubeconfig() -> None:
             logger.debug("Refreshed kubeconfig token")
 
 
-@dataclass
-class AWSConfig:
-    """AWS-specific configuration for the EKS/Fargate backend."""
+@dataclass(frozen=True)
+class ClusterConfig:
+    """Process-wide cluster configuration loaded from a CloudFormation stack.
+
+    All fields are shared across every trial in the process. Construct via
+    ``load_config_from_stack()``; do not instantiate directly.
+    """
 
     # AWS credentials
     region: str = "us-east-1"
@@ -48,24 +52,17 @@ class AWSConfig:
     # AWS account (needed for ECR pull-through cache URI)
     account_id: str | None = None
 
-    # ECR pull-through cache (opt-in, requires setup — see README)
-    ecr_cache: bool = False
-
-    # Maximum pod lifetime in seconds (default: 4 hours)
-    pod_timeout_sec: int = 14400
-
     # Stack-based configuration
     stack_name: str | None = None
 
-    # L3 control plane (auto-discovered from stack + K8s if not set)
-    admin_token: str | None = None
-    control_url: str | None = None
+    # Control plane bearer token (from stack output)
+    bearer_token: str | None = None
 
     def validate(self) -> None:
         """Validate that required fields are set."""
         if not self.eks_cluster_name:
             raise ValueError(
-                "Missing required AWS config field: eks_cluster_name. "
+                "Missing required cluster config field: eks_cluster_name. "
                 "Use stack_name to read from CloudFormation outputs."
             )
 
@@ -95,10 +92,24 @@ class AWSConfig:
         return env
 
 
+@dataclass(frozen=True)
+class TrialOptions:
+    """Per-trial overrides set by the adapter caller (kwargs to ``AWSEnvironment``)."""
+
+    # ECR pull-through cache (opt-in, requires setup — see README)
+    ecr_cache: bool = False
+
+    # Maximum pod lifetime in seconds (default: 4 hours)
+    pod_timeout_sec: int = 14400
+
+    # If True, attach the cluster's pod service account so the pod can call Bedrock.
+    use_bedrock: bool = False
+
+
 _kubeconfig_setup = False
 
 
-def create_k8s_client(config: AWSConfig) -> client.CoreV1Api:
+def create_k8s_client(config: ClusterConfig) -> client.CoreV1Api:
     """Create a Kubernetes CoreV1Api client for the EKS cluster."""
     global _kubeconfig_setup
 
@@ -121,10 +132,10 @@ async def load_config_from_stack(
     stack_name: str,
     region: str = "us-east-1",
     role_arn: str | None = None,
-) -> AWSConfig:
-    """Load AWSConfig from CloudFormation stack outputs."""
+) -> ClusterConfig:
+    """Load ClusterConfig from CloudFormation stack outputs."""
 
-    tmp = AWSConfig(region=region, role_arn=role_arn)
+    tmp = ClusterConfig(region=region, role_arn=role_arn)
 
     def _read_outputs() -> tuple[dict[str, str], str]:
         session = tmp.create_boto3_session()
@@ -149,7 +160,7 @@ async def load_config_from_stack(
     outputs, account_id = await asyncio.to_thread(_read_outputs)
     logger.debug("Loaded %d outputs from stack '%s'", len(outputs), stack_name)
 
-    config = AWSConfig(
+    config = ClusterConfig(
         region=region,
         role_arn=role_arn,
         stack_name=stack_name,
@@ -157,7 +168,7 @@ async def load_config_from_stack(
         namespace=outputs.get("Namespace", "harbor"),
         k8s_service_account=outputs.get("PodServiceAccount"),
         account_id=account_id,
-        admin_token=outputs.get("HarborAdminToken"),
+        bearer_token=outputs.get("HarborAdminToken"),
     )
 
     config.validate()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 
@@ -52,6 +53,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # boto3 picks up AWS_PROFILE automatically — set it once so every code
+    # path uses the right credentials without each call site passing it through.
+    if getattr(args, "profile", None):
+        os.environ["AWS_PROFILE"] = args.profile
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
@@ -73,38 +79,33 @@ def _deploy(args: argparse.Namespace) -> None:
     outputs = deploy(
         stack_prefix=args.stack_name,
         region=args.region,
-        profile_name=args.profile,
         runner_account_ids=args.runner_accounts,
     )
     token = outputs.get("HarborAdminToken", "")
     cluster_name = outputs.get("EksClusterName", args.stack_name)
-    nlb_host = _wait_for_nlb(cluster_name, args.region, args.profile)
+    nlb_host = _wait_for_nlb(cluster_name, args.region)
 
     print("\n" + "=" * 60)
     print("harbor-aws is ready!")
     print("=" * 60)
-    print(f"\n  HARBOR_CONTROL_URL=http://{nlb_host}:8443")
-    print(f"  HARBOR_ADMIN_TOKEN={token}")
+    print(f"\n  HARBOR_NLB_URL=http://{nlb_host}:8443")
+    print(f"  HARBOR_BEARER_TOKEN={token}")
     print("\nRun benchmarks:")
-    print(f"  HARBOR_CONTROL_URL=http://{nlb_host}:8443 \\")
-    print(f"  HARBOR_ADMIN_TOKEN={token} \\")
+    print(f"  HARBOR_NLB_URL=http://{nlb_host}:8443 \\")
+    print(f"  HARBOR_BEARER_TOKEN={token} \\")
     print("  harbor jobs start -p ./task \\")
     print("    --environment-import-path harbor_aws.adapter:AWSEnvironment \\")
     print(f"    --ek stack_name={args.stack_name} --ek ecr_cache=true")
 
 
-def _wait_for_nlb(
-    cluster_name: str, region: str, profile: str | None, timeout: int = 300,
-) -> str:
+def _wait_for_nlb(cluster_name: str, region: str, timeout: int = 300) -> str:
     """Poll the NLB Service until an external hostname is assigned."""
     import asyncio
     import time
 
     from harbor_aws.core.config import create_k8s_client, load_config_from_stack
 
-    config = asyncio.run(load_config_from_stack(
-        stack_name=cluster_name, region=region, profile_name=profile,
-    ))
+    config = asyncio.run(load_config_from_stack(stack_name=cluster_name, region=region))
     api = create_k8s_client(config)
 
     print("\nWaiting for NLB endpoint...")
@@ -127,7 +128,7 @@ def _wait_for_nlb(
 def _status(args: argparse.Namespace) -> None:
     import boto3
 
-    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    session = boto3.Session(region_name=args.region)
     cfn = session.client("cloudformation")
 
     try:
@@ -157,7 +158,6 @@ def _stop(args: argparse.Namespace) -> None:
     config = asyncio.run(load_config_from_stack(
         stack_name=args.stack_name,
         region=args.region,
-        profile_name=args.profile,
     ))
     api = create_k8s_client(config)
 
@@ -175,7 +175,7 @@ def _destroy(args: argparse.Namespace) -> None:
     from harbor_aws.cdk.destroy import destroy, get_destroy_summary
 
     try:
-        summary = get_destroy_summary(args.stack_name, args.region, args.profile)
+        summary = get_destroy_summary(args.stack_name, args.region)
     except Exception as e:
         if "does not exist" in str(e):
             print(f"Stack '{args.stack_name}' does not exist.")
@@ -206,7 +206,7 @@ def _destroy(args: argparse.Namespace) -> None:
         pass
 
     # Tear down infrastructure
-    destroy(args.stack_name, args.region, args.profile)
+    destroy(args.stack_name, args.region)
 
 
 if __name__ == "__main__":

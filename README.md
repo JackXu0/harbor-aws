@@ -10,13 +10,13 @@ AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framewo
 Orchestrator (laptop / CI)
     |  HTTPS via NLB
     v
-harbor-control pod (in-cluster gateway)
+Control pod (in-cluster gateway)
     |  TCP via /dev/tcp
     v
 Trial pods (one per task, Fargate)
 ```
 
-Each trial pod runs a small **bash runner** (`runner.sh`) as PID 1 — no Python needed in the trial image. The runner dials the in-cluster **harbor-control** gateway over plain TCP. The orchestrator talks to harbor-control over an NLB. The K8s API server is only used for pod create/delete, never in the exec data path.
+Each trial pod runs a small **bash runner** (`runner.sh`) as PID 1 — no Python needed in the trial image. The runner dials the in-cluster **control pod** over plain TCP. The orchestrator talks to the control pod over an NLB. The K8s API server is only used for pod create/delete, never in the exec data path.
 
 ## Install
 
@@ -32,17 +32,23 @@ pip install "harbor-aws[cdk]"
 python -m harbor_aws deploy --region us-east-1
 ```
 
-Creates everything: VPC, EKS, harbor-control, NLB, Load Balancer Controller.
+Creates everything: VPC, EKS, control pod Deployment, NLB, Load Balancer Controller. Prints the `HARBOR_NLB_URL` and `HARBOR_BEARER_TOKEN` values to copy into step 2.
 
 ### 2. Run benchmarks
 
 ```bash
-harbor jobs start -p ./task -a nop -n 2500 \
+export HARBOR_NLB_URL=http://<nlb-dns>:8443
+export HARBOR_BEARER_TOKEN=<bearer-token>
+
+# Example: terminal-bench with terminus-2 + Sonnet 4.6 via Bedrock, 89 concurrent trials.
+harbor jobs start --task-git-url https://github.com/laude-institute/terminal-bench \
+  -a terminus-2 -m bedrock/us.anthropic.claude-sonnet-4-6-v1:0 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
-  --ek stack_name=harbor-aws --ek ecr_cache=true
+  --ek stack_name=harbor-aws --ek ecr_cache=true \
+  -n 89 --max-retries 2
 ```
 
-The adapter auto-discovers the NLB endpoint and admin token from the stack. No env vars needed.
+`HARBOR_NLB_URL` is the NLB DNS that fronts the control pod; `HARBOR_BEARER_TOKEN` is the bearer token the control pod checks on each request. If you're using Bedrock, also make sure your shell has AWS credentials with `bedrock:InvokeModel` permission (e.g. `AWS_PROFILE=...`).
 
 ### 3. Clean up
 
@@ -57,7 +63,7 @@ python -m harbor_aws destroy   # tear down everything
 |---|---|
 | EKS control plane | ~$73/mo (fixed) |
 | Fargate trial pods | per-second, only when running |
-| harbor-control pod | ~$5/mo (always-on) |
+| Control pod | ~$5/mo (always-on) |
 | NLB | ~$16/mo |
 
 ## Development

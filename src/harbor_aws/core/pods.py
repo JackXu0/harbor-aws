@@ -10,7 +10,8 @@ import uuid
 from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
-from harbor_aws.core.config import AWSConfig
+from harbor_aws.core import images
+from harbor_aws.core.config import ClusterConfig
 from harbor_aws.core.watcher import PodWatcher
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ exec bash /harbor-runner/runner.sh
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=2, max=15, jitter=3), reraise=True)
 async def create_pod(
     api: client.CoreV1Api,
-    config: AWSConfig,
+    config: ClusterConfig,
     image_uri: str,
     environment_name: str,
     session_id: str,
@@ -53,10 +54,11 @@ async def create_pod(
     memory_mb: int,
     trial_id: str,
     trial_token: str,
-    runner_configmap: str,
-    control_host: str,
-    control_runner_port: int,
-    image_pull_secret: str | None = None,
+    pod_timeout_sec: int,
+    runner_configmap: str = "harbor-runner",
+    control_host: str = "harbor-control.harbor.svc.cluster.local",
+    control_runner_port: int = 8444,
+    service_account: str | None = None,
 ) -> str:
     """Create a Fargate pod that runs the harbor runner.sh as PID 1.
 
@@ -67,6 +69,7 @@ async def create_pod(
     """
     pod_name = _make_pod_name(session_id)
     resources = {"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"}
+    pull_secret = await images.ensure_docker_pull_secret(api, config)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(
@@ -77,7 +80,6 @@ async def create_pod(
                 "harbor-session": session_id[:63],
                 "harbor-env": environment_name[:63],
                 "managed-by": "harbor-aws",
-                "harbor-mode": "layer3",
             },
         ),
         spec=client.V1PodSpec(
@@ -112,10 +114,10 @@ async def create_pod(
                     resources=client.V1ResourceRequirements(requests=resources, limits=resources),
                 ),
             ],
-            active_deadline_seconds=config.pod_timeout_sec,
-            service_account_name=config.k8s_service_account or None,
+            active_deadline_seconds=pod_timeout_sec,
+            service_account_name=service_account or None,
             restart_policy="Never",
-            image_pull_secrets=[client.V1LocalObjectReference(name=image_pull_secret)] if image_pull_secret else None,
+            image_pull_secrets=[client.V1LocalObjectReference(name=pull_secret)] if pull_secret else None,
         ),
     )
 
@@ -127,12 +129,12 @@ async def create_pod(
         else:
             raise
 
-    logger.debug("Created layer3 pod: %s (image=%s)", pod_name, image_uri)
+    logger.debug("Created pod: %s (image=%s)", pod_name, image_uri)
     return pod_name
 
 
 async def wait_for_pod_running(
-    config: AWSConfig, pod_name: str, timeout_sec: int = 1800,
+    config: ClusterConfig, pod_name: str, timeout_sec: int = 1800,
 ) -> None:
     """Wait until the pod's main container is Running.
 
@@ -154,7 +156,7 @@ async def wait_for_pod_running(
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=1, max=10, jitter=2), reraise=True)
-async def delete_pod(api: client.CoreV1Api, config: AWSConfig, pod_name: str) -> None:
+async def delete_pod(api: client.CoreV1Api, config: ClusterConfig, pod_name: str) -> None:
     """Delete a pod. Idempotent — ignores 404."""
     try:
         await asyncio.to_thread(api.delete_namespaced_pod, name=pod_name, namespace=config.namespace, grace_period_seconds=0)
@@ -167,7 +169,7 @@ async def delete_pod(api: client.CoreV1Api, config: AWSConfig, pod_name: str) ->
         PodWatcher._instance.unregister(pod_name)
 
 
-async def list_pods(api: client.CoreV1Api, config: AWSConfig) -> list[str]:
+async def list_pods(api: client.CoreV1Api, config: ClusterConfig) -> list[str]:
     """List all harbor-aws pods in the namespace."""
     pods = await asyncio.to_thread(
         api.list_namespaced_pod, namespace=config.namespace, label_selector="managed-by=harbor-aws",
