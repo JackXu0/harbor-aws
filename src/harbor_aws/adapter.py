@@ -1,14 +1,7 @@
 """Harbor BaseEnvironment adapter for AWS EKS/Fargate.
 
-Layer 3 architecture:
-  - kubectl create_pod / delete_pod via the K8s API server (control plane only).
-  - Pod runs ``harbor_aws/runner.sh`` as PID 1 (mounted via ConfigMap), which
-    dials out to the in-cluster harbor-control server over in-VPC TCP.
-  - The Mac talks to harbor-control over HTTPS via an NLB, using one
-    process-wide aiohttp ClientSession (HTTP keepalive across all trials).
-  - All exec / file transfer flows Mac → NLB → control server → trial pod.
-    The K8s apiserver is **not** in the data path, and ``kubectl exec`` is
-    never used.
+AWSEnvironment implements Harbor's sandbox interface (start, exec,
+upload/download, stop) by running each trial in a Fargate pod.
 """
 
 from __future__ import annotations
@@ -58,13 +51,6 @@ def _match_resource_profile(image: str) -> tuple[int, int] | None:
 
 
 class AWSEnvironment(BaseEnvironment):
-    """AWS EKS/Fargate sandbox for Harbor benchmarks.
-
-    Each sandbox is a Kubernetes pod on EKS Fargate. The pod's PID 1 is a
-    bash runner that dials the harbor-control server (in-VPC); all command
-    execution and file transfer flow through that connection. See module
-    docstring for the full data path.
-    """
 
     # -- Class-level shared state (avoid repeated API calls across instances) --
     _cached_stack_config: AWSConfig | None = None
