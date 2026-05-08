@@ -4,19 +4,17 @@
 
 AWS EKS/Fargate execution backend for [Harbor](https://github.com/harbor-framework/harbor) benchmarks. Run thousands of sandbox trials in parallel with per-second billing and VM-level isolation.
 
-## How it works
+## System Overview
 
-```
-Orchestrator (laptop / CI)
-    |  HTTPS via NLB
-    v
-Control pod (in-cluster gateway)
-    |  TCP via /dev/tcp
-    v
-Trial pods (one per task, Fargate)
-```
+![harbor-aws architecture](docs/architecture.png)
 
-Each trial pod runs a small **bash runner** (`runner.sh`) as PID 1 — no Python needed in the trial image. The runner dials the in-cluster **control pod** over plain TCP. The orchestrator talks to the control pod over an NLB. The K8s API server is only used for pod create/delete, never in the exec data path.
+## Main Bottleneck
+
+The main bottleneck of running Harbor benchmarks on AWS EKS Fargate is using Kubernetes `exec` as the command execution path. As concurrency grows, the EKS control plane can become the limiting factor instead of the underlying Fargate compute capacity.
+
+## Solution
+
+Harbor-aws exposes an in-cluster Harbor control service through a Network Load Balancer. The control service maintains long-lived connections with the trial pods. Benchmark commands are sent to the control service and then forwarded to the target pod without going through the AWS-managed Kubernetes control plane.
 
 ## Install
 
@@ -48,23 +46,12 @@ harbor jobs start --task-git-url https://github.com/laude-institute/terminal-ben
   -n 89 --max-retries 2
 ```
 
-`HARBOR_NLB_URL` is the NLB DNS that fronts the control pod; `HARBOR_BEARER_TOKEN` is the bearer token the control pod checks on each request. If you're using Bedrock, also make sure your shell has AWS credentials with `bedrock:InvokeModel` permission (e.g. `AWS_PROFILE=...`).
-
 ### 3. Clean up
 
 ```bash
 python -m harbor_aws stop      # delete trial pods, keep infra
 python -m harbor_aws destroy   # tear down everything
 ```
-
-## Cost
-
-| Component | Cost |
-|---|---|
-| EKS control plane | ~$73/mo (fixed) |
-| Fargate trial pods | per-second, only when running |
-| Control pod | ~$5/mo (always-on) |
-| NLB | ~$16/mo |
 
 ## Development
 
