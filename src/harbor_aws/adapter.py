@@ -157,10 +157,9 @@ class AWSEnvironment(BaseEnvironment):
                 service_account = self.cluster_config.k8s_service_account if self.trial_options.use_bedrock else None
                 self.pod_name = await pods.create_pod(
                     runtime.get_k8s_client(self.cluster_config),
-                    self.cluster_config,
+                    self.cluster_config.namespace,
                     image_uri,
                     self.environment_name,
-                    self.session_id,
                     cpus=pod_cpus,
                     memory_mb=pod_memory,
                     trial_id=self.session_id,
@@ -169,7 +168,7 @@ class AWSEnvironment(BaseEnvironment):
                     service_account=service_account,
                 )
 
-            await pods.wait_for_pod_running(self.cluster_config, self.pod_name)
+            await pods.wait_for_pod_running(self.cluster_config.namespace, self.pod_name)
             await register_task
         except Exception:
             register_task.cancel()
@@ -198,7 +197,7 @@ class AWSEnvironment(BaseEnvironment):
                 self.remote_shell = None
             if self.pod_name and self.cluster_config is not None:
                 k8s_api = runtime.get_k8s_client(self.cluster_config)
-                await pods.delete_pod(k8s_api, self.cluster_config, self.pod_name)
+                await pods.delete_pod(k8s_api, self.cluster_config.namespace, self.pod_name)
         except Exception as e:
             self.logger.warning("Error deleting pod: %s", e)
         finally:

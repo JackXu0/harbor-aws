@@ -53,7 +53,7 @@ def _get_ecr_client(cluster: ClusterConfig):  # noqa: ANN202 — boto3 client ty
 
 async def ensure_docker_pull_secret(
     k8s_api: client.CoreV1Api,
-    cluster: ClusterConfig,
+    namespace: str,
 ) -> str | None:
     """Create imagePullSecret from ~/.docker/config.json if not already present.
 
@@ -84,7 +84,7 @@ async def ensure_docker_pull_secret(
     try:
         await asyncio.to_thread(
             k8s_api.create_namespaced_secret,
-            namespace=cluster.namespace, body=secret,
+            namespace=namespace, body=secret,
         )
     except client.ApiException as e:
         if e.status != 409:

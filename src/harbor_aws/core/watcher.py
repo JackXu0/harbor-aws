@@ -91,6 +91,12 @@ class PodWatcher:
             self._handles.pop(pod_name, None)
             self._cached_statuses.pop(pod_name, None)
 
+    @classmethod
+    def unregister_if_active(cls, pod_name: str) -> None:
+        """Unregister a pod from the singleton watcher if one exists. No-op otherwise."""
+        if cls._instance is not None:
+            cls._instance.unregister(pod_name)
+
     def stop(self) -> None:
         self._stopped.set()
         with PodWatcher._instance_lock:

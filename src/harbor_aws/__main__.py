@@ -161,13 +161,13 @@ def _stop(args: argparse.Namespace) -> None:
     ))
     api = create_k8s_client(config)
 
-    pod_names = asyncio.run(list_pods(api, config))
+    pod_names = asyncio.run(list_pods(api, config.namespace))
     if not pod_names:
         print("No running pods.")
         return
 
     for name in pod_names:
-        asyncio.run(delete_pod(api, config, name))
+        asyncio.run(delete_pod(api, config.namespace, name))
     print(f"Deleted {len(pod_names)} pod(s). Infrastructure ready for next run.")
 
 
