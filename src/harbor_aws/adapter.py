@@ -143,7 +143,7 @@ class AWSEnvironment(BaseEnvironment):
 
         self.remote_shell = RemoteShell(
             trial_id=self.session_id,
-            token=trial_token,
+            trial_token=trial_token,
             nlb_url=runtime.get_nlb_url(),
             bearer_token=runtime.get_bearer_token(),
             session=runtime.get_session(),

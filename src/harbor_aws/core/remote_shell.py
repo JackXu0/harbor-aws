@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import tarfile
 from pathlib import Path
+from shlex import quote as _q
 from typing import Any
 
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteShell:
@@ -32,24 +36,17 @@ class RemoteShell:
     def __init__(
         self,
         trial_id: str,
-        token: str,
+        trial_token: str,
         nlb_url: str,
         bearer_token: str,
-        session: aiohttp.ClientSession | None = None,
+        session: aiohttp.ClientSession,
     ) -> None:
         self._trial_id = trial_id
-        self._token = token
+        self._trial_token = trial_token
         self._nlb_url = nlb_url.rstrip("/")
         self._bearer_token = bearer_token
         self._session = session
-        self._owns_session = session is None
         self._closed = False
-
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
-            self._session = aiohttp.ClientSession(connector=connector)
-        return self._session
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -58,22 +55,12 @@ class RemoteShell:
     # --- lifecycle ---
 
     async def connect(self, connect_timeout: float = 600.0) -> None:
-        """Pre-register the trial with the control server.
-
-        With the reverse-runner architecture this call returns once the runner
-        pod has dialed in to the control server and authenticated. The control
-        server will block up to ``connect_timeout`` seconds waiting for that.
-
-        Default 600 s gives heavy ML base images (PyTorch, HuggingFace, etc.)
-        room to pull from Docker Hub on cold caches — observed pulls in the
-        wild can take 4-7 minutes.
-        """
-        s = await self._ensure_session()
-        async with s.post(
+        """Pre-register the trial with the control server."""
+        async with self._session.post(
             f"{self._nlb_url}/register",
             json={
                 "trial_id": self._trial_id,
-                "token": self._token,
+                "token": self._trial_token,
                 "connect_timeout": connect_timeout,
             },
             headers=self._headers,
@@ -91,18 +78,14 @@ class RemoteShell:
             return
         self._closed = True
         try:
-            s = await self._ensure_session()
-            async with s.post(
+            async with self._session.post(
                 f"{self._nlb_url}/stop",
                 json={"trial_id": self._trial_id},
                 headers=self._headers,
             ) as resp:
                 await resp.read()
-        except Exception:  # noqa: BLE001
-            pass
-        if self._owns_session and self._session is not None:
-            await self._session.close()
-            self._session = None
+        except Exception:
+            logger.warning("RemoteShell.close() /stop failed for trial %s", self._trial_id, exc_info=True)
 
     # --- command execution ---
 
@@ -115,7 +98,6 @@ class RemoteShell:
     ) -> tuple[str, str, int]:
         if self._closed:
             raise RuntimeError("RemoteShell is closed")
-        s = await self._ensure_session()
         body: dict[str, Any] = {
             "trial_id": self._trial_id,
             "cmd": command,
@@ -123,7 +105,7 @@ class RemoteShell:
             "env": env,
             "timeout_sec": timeout_sec,
         }
-        async with s.post(
+        async with self._session.post(
             f"{self._nlb_url}/exec", json=body, headers=self._headers
         ) as resp:
             payload = await resp.json()
@@ -213,6 +195,3 @@ class RemoteShell:
             tar.extractall(path=str(local), filter="data")
 
 
-def _q(s: str) -> str:
-    """Single-quote shell-escape."""
-    return "'" + s.replace("'", "'\\''") + "'"
