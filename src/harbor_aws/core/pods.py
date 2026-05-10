@@ -16,8 +16,6 @@ from harbor_aws.core.watcher import PodWatcher
 logger = logging.getLogger(__name__)
 
 RUNNER_CONFIGMAP = "harbor-runner"
-CONTROL_HOST = "harbor-control.harbor.svc.cluster.local"
-CONTROL_RUNNER_PORT = 8444
 
 EXECUTABLE_MODE = 0o755
 
@@ -93,10 +91,8 @@ async def create_pod(
                     command=["sh", "-c", _RUNNER_BOOTSTRAP_SH],
                     security_context=client.V1SecurityContext(run_as_user=0),
                     env=[
-                        client.V1EnvVar(name="HARBOR_TOKEN", value=trial_token),
+                        client.V1EnvVar(name="HARBOR_TRIAL_TOKEN", value=trial_token),
                         client.V1EnvVar(name="HARBOR_TRIAL_ID", value=trial_id),
-                        client.V1EnvVar(name="HARBOR_CONTROL_HOST", value=CONTROL_HOST),
-                        client.V1EnvVar(name="HARBOR_CONTROL_PORT", value=str(CONTROL_RUNNER_PORT)),
                     ],
                     volume_mounts=[
                         client.V1VolumeMount(

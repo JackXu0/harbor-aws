@@ -1,64 +1,36 @@
 #!/bin/bash
-# harbor-aws pod runner — outbound TCP client to the harbor-control server.
-#
-# Replaces the previous runner.py. Pure bash, uses /dev/tcp, no extra binaries
-# beyond coreutils (base64, timeout, mktemp). Works on any image with bash;
-# the start-up bootstrap installs bash via apk on Alpine if necessary.
-#
-# Wire protocol — newline-delimited frames over the TCP connection. base64
-# encoding on commands and outputs avoids any newline collisions in payloads.
-#
-#   Runner -> control:
-#     A\n<token>\n<trial_id>\n              (auth, first frame)
-#     R\n<cmd_id>\n<rc>\n<b64_stdout>\n<b64_stderr>\n   (result)
-#     Q\n                                   (pong)
-#
-#   Control -> runner:
-#     OK\n                                  (auth ok)
-#     FAIL\n<reason>\n                      (auth fail)
-#     E\n<cmd_id>\n<timeout_sec>\n<b64_cmd>\n   (exec)
-#     P\n                                   (ping, optional keepalive)
-#     S\n                                   (shutdown)
-#
-# Env vars (set by harbor-aws when creating the pod):
-#   HARBOR_CONTROL_HOST   in-cluster DNS name of the harbor-control service
-#   HARBOR_CONTROL_PORT   runner-accept port on the control server (e.g. 8444)
-#   HARBOR_TRIAL_ID       unique id for this trial pod
-#   HARBOR_TOKEN          shared secret. The control server pre-registers
-#                         {trial_id -> token} and validates this on auth.
+# runner.sh runs once per trial pod, for the whole pod's lifetime, holding
+# one persistent TCP connection to the control pod. Inside it, a `bash <script>`
+# subprocess is spawned per exec call. The script's main loop dispatches exec
+# frames into those subprocesses and forwards results back.
 
 set -u
 
-: "${HARBOR_CONTROL_HOST:?missing HARBOR_CONTROL_HOST}"
-: "${HARBOR_CONTROL_PORT:?missing HARBOR_CONTROL_PORT}"
+: "${HARBOR_CONTROL_SERVICE_HOST:?missing HARBOR_CONTROL_SERVICE_HOST (kubelet should auto-inject)}"
+: "${HARBOR_CONTROL_SERVICE_PORT:?missing HARBOR_CONTROL_SERVICE_PORT (kubelet should auto-inject)}"
 : "${HARBOR_TRIAL_ID:?missing HARBOR_TRIAL_ID}"
-: "${HARBOR_TOKEN:?missing HARBOR_TOKEN}"
+: "${HARBOR_TRIAL_TOKEN:?missing HARBOR_TRIAL_TOKEN}"
 
-# base64 -w0 isn't in busybox base64; fall back to tr -d '\n'.
+# Encode any bytes as a single-line ASCII string
 b64() {
-    if base64 --help 2>&1 | grep -q -- '-w'; then
-        base64 -w0
-    else
-        base64 | tr -d '\n'
-    fi
+    base64 | tr -d '\n'
 }
 
-# Open TCP connection to harbor-control. Retry on DNS / connect failures —
-# CoreDNS gets overwhelmed when thousands of pods start simultaneously.
+# Establish TCP connection to the control pod
 attempt=0
-while ! exec 3<>/dev/tcp/"$HARBOR_CONTROL_HOST"/"$HARBOR_CONTROL_PORT" 2>/dev/null; do
+while ! exec 3<>/dev/tcp/"$HARBOR_CONTROL_SERVICE_HOST"/"$HARBOR_CONTROL_SERVICE_PORT" 2>/dev/null; do
     attempt=$((attempt + 1))
     if [ $attempt -ge 30 ]; then
-        echo "harbor-runner: failed to connect to $HARBOR_CONTROL_HOST:$HARBOR_CONTROL_PORT after $attempt attempts" >&2
+        echo "harbor-runner: failed to connect to $HARBOR_CONTROL_SERVICE_HOST:$HARBOR_CONTROL_SERVICE_PORT after $attempt attempts" >&2
         exit 1
     fi
     sleep 2
 done
 
-# Send auth frame.
-printf 'A\n%s\n%s\n' "$HARBOR_TOKEN" "$HARBOR_TRIAL_ID" >&3
+# Send auth frame to control pod
+printf 'A\n%s\n%s\n' "$HARBOR_TRIAL_TOKEN" "$HARBOR_TRIAL_ID" >&3
 
-# Read auth response.
+# Read auth response
 if ! IFS= read -r resp <&3; then
     echo "harbor-runner: auth read failed" >&2
     exit 1
