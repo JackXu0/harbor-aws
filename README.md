@@ -60,10 +60,8 @@ harbor jobs start \
   -a terminus-2 \
   -m bedrock/us.anthropic.claude-sonnet-4-6-v1:0 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
-  --ek stack_name=harbor-aws \
   --ek ecr_cache=true \
-  -n 89 \
-  --max-retries 2
+  -n 89
 ```
 
 ### 4. Clean up
