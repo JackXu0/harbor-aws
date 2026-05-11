@@ -20,6 +20,7 @@ Harbor-aws exposes an in-cluster Harbor control service through a Network Load B
 
 ```bash
 pip install "harbor-aws[cdk]"
+npm install -g aws-cdk
 ```
 
 ## Quick start
@@ -27,30 +28,49 @@ pip install "harbor-aws[cdk]"
 ### 1. Deploy (~15 min, one-time)
 
 ```bash
-python -m harbor_aws deploy --region us-east-1
+cdk bootstrap                                  
+harbor-aws deploy --region us-east-1
 ```
 
-Creates everything: VPC, EKS, control pod Deployment, NLB, Load Balancer Controller. Prints the `HARBOR_NLB_URL` and `HARBOR_BEARER_TOKEN` values to copy into step 2.
+Creates VPC, EKS, control pod, NLB. Outputs `HarborAdminToken` + NLB DNS on completion.
 
-### 2. Run benchmarks
+### 2. (Recommended at scale) ECR pull-through cache
+
+Anonymous Docker Hub pulls are rate-limited (~100/6h per IP); Fargate pods share one NAT, so >100 concurrent trials hit `ImagePullBackOff`. Route pulls through an ECR pull-through cache:
+
+```bash
+aws secretsmanager create-secret \
+  --name ecr-pullthroughcache/docker-hub \
+  --secret-string '{"username":"<user>","accessToken":"<token>"}'   # any Docker Hub account (free works)
+
+harbor-aws deploy --docker-hub-secret-arn <secret-arn>
+```
+
+Then pass `--ek ecr_cache=true` to `harbor jobs` (step 3).
+
+### 3. Run benchmarks
 
 ```bash
 export HARBOR_NLB_URL=http://<nlb-dns>:8443
 export HARBOR_BEARER_TOKEN=<bearer-token>
 
 # Example: terminal-bench with terminus-2 + Sonnet 4.6 via Bedrock, 89 concurrent trials.
-harbor jobs start --task-git-url https://github.com/laude-institute/terminal-bench \
-  -a terminus-2 -m bedrock/us.anthropic.claude-sonnet-4-6-v1:0 \
+harbor jobs start \
+  --task-git-url https://github.com/laude-institute/terminal-bench \
+  -a terminus-2 \
+  -m bedrock/us.anthropic.claude-sonnet-4-6-v1:0 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
-  --ek stack_name=harbor-aws --ek ecr_cache=true \
-  -n 89 --max-retries 2
+  --ek stack_name=harbor-aws \
+  --ek ecr_cache=true \
+  -n 89 \
+  --max-retries 2
 ```
 
-### 3. Clean up
+### 4. Clean up
 
 ```bash
-python -m harbor_aws stop      # delete trial pods, keep infra
-python -m harbor_aws destroy   # tear down everything
+harbor-aws stop              # delete trial pods, keep cluster
+harbor-aws destroy --force   # tear down everything
 ```
 
 ## Development

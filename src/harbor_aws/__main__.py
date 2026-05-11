@@ -1,10 +1,10 @@
 """CLI entry point: python -m harbor_aws <command>
 
 Commands:
-    deploy   - Create harbor-aws EKS infrastructure in your AWS account
+    deploy   - Deploy the harbor-aws CDK stack (one-shot, no scaffolding)
+    destroy  - Tear down the harbor-aws stack
     status   - Check if infrastructure is deployed
     stop     - Delete all running pods (keeps infrastructure)
-    destroy  - Tear down everything
 """
 
 from __future__ import annotations
@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 
 def main() -> None:
@@ -24,32 +27,45 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="command")
 
-    # deploy
-    deploy_p = sub.add_parser("deploy", help="deploy infrastructure (idempotent)")
-    deploy_p.add_argument("--stack-name", default="harbor-aws", help="CloudFormation stack name (default: harbor-aws)")
-    deploy_p.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1)")
-    deploy_p.add_argument("--profile", default=None, help="AWS CLI profile name")
-    deploy_p.add_argument("--runner-account", action="append", default=None, dest="runner_accounts",
-                          help="AWS account ID allowed to assume the runner role (repeatable)")
+    deploy_p = sub.add_parser("deploy", help="deploy the harbor-aws CDK stack")
+    _add_cdk_args(deploy_p)
+    deploy_p.add_argument(
+        "--cluster-admin-role-arn",
+        default=None,
+        help="IAM role ARN granted EKS cluster-admin (so kubectl works for that role)",
+    )
+    deploy_p.add_argument(
+        "--docker-hub-secret-arn",
+        default=None,
+        help="Secrets Manager ARN for Docker Hub credentials (enables ECR pull-through cache)",
+    )
+    deploy_p.add_argument(
+        "--cross-account-caller-id",
+        action="append",
+        default=None,
+        dest="cross_account_caller_ids",
+        help="AWS account ID allowed to assume the runner role (repeat for multiple)",
+    )
+    deploy_p.add_argument(
+        "--require-approval",
+        choices=["never", "any-change", "broadening"],
+        default="never",
+        help="cdk deploy --require-approval value (default: never)",
+    )
 
-    # status
+    destroy_p = sub.add_parser("destroy", help="tear down the harbor-aws stack")
+    _add_cdk_args(destroy_p)
+    destroy_p.add_argument("--force", action="store_true", help="skip confirmation prompt")
+
     status_p = sub.add_parser("status", help="check infrastructure status")
     status_p.add_argument("--stack-name", default="harbor-aws")
     status_p.add_argument("--region", default="us-east-1")
     status_p.add_argument("--profile", default=None)
 
-    # stop
     stop_p = sub.add_parser("stop", help="delete all running pods (keeps infrastructure)")
     stop_p.add_argument("--stack-name", default="harbor-aws")
     stop_p.add_argument("--region", default="us-east-1")
     stop_p.add_argument("--profile", default=None)
-
-    # destroy
-    destroy_p = sub.add_parser("destroy", help="tear down everything")
-    destroy_p.add_argument("--stack-name", default="harbor-aws")
-    destroy_p.add_argument("--region", default="us-east-1")
-    destroy_p.add_argument("--profile", default=None)
-    destroy_p.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
 
     args = parser.parse_args()
 
@@ -65,7 +81,12 @@ def main() -> None:
     logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("kubernetes").setLevel(logging.WARNING)
 
-    commands = {"deploy": _deploy, "status": _status, "stop": _stop, "destroy": _destroy}
+    commands = {
+        "deploy": _deploy,
+        "destroy": _destroy,
+        "status": _status,
+        "stop": _stop,
+    }
     if args.command in commands:
         commands[args.command](args)
     else:
@@ -73,56 +94,59 @@ def main() -> None:
         sys.exit(1)
 
 
-def _deploy(args: argparse.Namespace) -> None:
-    from harbor_aws.cdk.deploy import deploy
+def _add_cdk_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--stack-name", default="harbor-aws")
+    p.add_argument("--region", default="us-east-1")
+    p.add_argument("--profile", default=None)
 
-    outputs = deploy(
-        stack_prefix=args.stack_name,
-        region=args.region,
-        runner_account_ids=args.runner_accounts,
+
+def _synth(args: argparse.Namespace, outdir: str) -> None:
+    """Build the cdk.App in-process and synth into ``outdir``."""
+    import aws_cdk as cdk
+
+    from harbor_aws.cdk.stack import HarborAWSStack
+
+    app = cdk.App(outdir=outdir)
+    HarborAWSStack(
+        app,
+        args.stack_name,
+        env=cdk.Environment(
+            account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
+            region=args.region,
+        ),
+        cluster_admin_role_arn=getattr(args, "cluster_admin_role_arn", None),
+        docker_hub_secret_arn=getattr(args, "docker_hub_secret_arn", None),
+        cross_account_caller_ids=getattr(args, "cross_account_caller_ids", None),
     )
-    token = outputs.get("HarborAdminToken", "")
-    cluster_name = outputs.get("EksClusterName", args.stack_name)
-    nlb_host = _wait_for_nlb(cluster_name, args.region)
-
-    print("\n" + "=" * 60)
-    print("harbor-aws is ready!")
-    print("=" * 60)
-    print(f"\n  HARBOR_NLB_URL=http://{nlb_host}:8443")
-    print(f"  HARBOR_BEARER_TOKEN={token}")
-    print("\nRun benchmarks:")
-    print(f"  HARBOR_NLB_URL=http://{nlb_host}:8443 \\")
-    print(f"  HARBOR_BEARER_TOKEN={token} \\")
-    print("  harbor jobs start -p ./task \\")
-    print("    --environment-import-path harbor_aws.adapter:AWSEnvironment \\")
-    print(f"    --ek stack_name={args.stack_name} --ek ecr_cache=true")
+    app.synth()
 
 
-def _wait_for_nlb(cluster_name: str, region: str, timeout: int = 300) -> str:
-    """Poll the NLB Service until an external hostname is assigned."""
-    import asyncio
-    import time
+def _run_cdk(cdk_args: list[str]) -> None:
+    if shutil.which("cdk") is None:
+        sys.exit(
+            "cdk CLI not found. Install with: npm install -g aws-cdk"
+        )
+    subprocess.run(["cdk", *cdk_args], check=True)
 
-    from harbor_aws.core.config import create_k8s_client, load_config_from_stack
 
-    config = asyncio.run(load_config_from_stack(stack_name=cluster_name, region=region))
-    api = create_k8s_client(config)
+def _deploy(args: argparse.Namespace) -> None:
+    with tempfile.TemporaryDirectory(prefix="harbor-aws-cdk-") as outdir:
+        _synth(args, outdir)
+        _run_cdk([
+            "deploy",
+            "--app", outdir,
+            "--require-approval", args.require_approval,
+            args.stack_name,
+        ])
 
-    print("\nWaiting for NLB endpoint...")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            svc = api.read_namespaced_service("harbor-control-nlb", config.namespace)
-            ingress = svc.status.load_balancer.ingress
-            if ingress and ingress[0].hostname:
-                print(f"  NLB: {ingress[0].hostname}")
-                return ingress[0].hostname
-        except Exception:
-            pass
-        time.sleep(10)
-    print("  NLB not ready yet. Check later with:")
-    print("    kubectl -n harbor get svc harbor-control-nlb")
-    return "<nlb-pending>"
+
+def _destroy(args: argparse.Namespace) -> None:
+    with tempfile.TemporaryDirectory(prefix="harbor-aws-cdk-") as outdir:
+        _synth(args, outdir)
+        cdk_args = ["destroy", "--app", outdir, args.stack_name]
+        if args.force:
+            cdk_args.append("--force")
+        _run_cdk(cdk_args)
 
 
 def _status(args: argparse.Namespace) -> None:
@@ -144,7 +168,6 @@ def _status(args: argparse.Namespace) -> None:
     except Exception as e:
         if "does not exist" in str(e):
             print(f"Stack '{args.stack_name}' does not exist in {args.region}.")
-            print(f"Deploy with: python -m harbor_aws deploy --region {args.region}")
         else:
             raise
 
@@ -169,44 +192,6 @@ def _stop(args: argparse.Namespace) -> None:
     for name in pod_names:
         asyncio.run(delete_pod(api, config.namespace, name))
     print(f"Deleted {len(pod_names)} pod(s). Infrastructure ready for next run.")
-
-
-def _destroy(args: argparse.Namespace) -> None:
-    from harbor_aws.cdk.destroy import destroy, get_destroy_summary
-
-    try:
-        summary = get_destroy_summary(args.stack_name, args.region)
-    except Exception as e:
-        if "does not exist" in str(e):
-            print(f"Stack '{args.stack_name}' does not exist.")
-            return
-        raise
-
-    outputs = summary["outputs"]
-    ecr_count = summary["ecr_repo_count"]
-
-    print(f"This will delete all harbor-aws resources in {args.region}:")
-    print(f"  Stack:      {args.stack_name}")
-    if outputs.get("EksClusterName"):
-        print(f"  EKS:        cluster '{outputs['EksClusterName']}' (+ delete pods)")
-    if ecr_count:
-        print(f"  ECR:        {ecr_count} pull-through cache repos (docker-hub/*)")
-    print("  + VPC, IAM roles, log groups")
-
-    if not args.yes:
-        confirm = input("\nProceed? [y/N] ")
-        if confirm.lower() != "y":
-            print("Cancelled.")
-            return
-
-    # Delete pods first (best-effort)
-    try:
-        _stop(args)
-    except Exception:
-        pass
-
-    # Tear down infrastructure
-    destroy(args.stack_name, args.region)
 
 
 if __name__ == "__main__":

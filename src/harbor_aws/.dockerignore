@@ -1,0 +1,8 @@
+# Used by harbor-control's Dockerfile via CDK DockerImageAsset.
+# Build context is this package directory; this restricts it to only the
+# files the Dockerfile actually COPYs, so unrelated package changes don't
+# invalidate the image cache and trigger rebuilds.
+
+**
+!Dockerfile
+!server.py
