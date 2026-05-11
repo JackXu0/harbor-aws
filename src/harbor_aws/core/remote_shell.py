@@ -54,7 +54,7 @@ class RemoteShell:
 
     # --- lifecycle ---
 
-    async def connect(self, connect_timeout: float = 600.0) -> None:
+    async def connect(self, connect_timeout: float = 1800.0) -> None:
         """Pre-register the trial with the control server."""
         async with self._session.post(
             f"{self._nlb_url}/register",
