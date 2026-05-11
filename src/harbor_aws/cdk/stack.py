@@ -473,6 +473,7 @@ class HarborAWSStack(cdk.Stack):
         cdk.CfnOutput(self, "PodServiceAccount", value=pod_sa.service_account_name)
         cdk.CfnOutput(self, "HarborAdminToken", value=bearer_token)
         cdk.CfnOutput(self, "HarborNlbCert", value=tls_cert_pem)
+        cdk.CfnOutput(self, "DockerHubCacheEnabled", value=str(docker_hub_secret_arn is not None).lower())
 
 
 def _generate_self_signed_cert() -> tuple[str, str]:

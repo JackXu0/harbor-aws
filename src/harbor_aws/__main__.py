@@ -93,6 +93,9 @@ def _add_cdk_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--profile", default=None)
 
 
+_DOCKERHUB_SECRET_NAME = "ecr-pullthroughcache/docker-hub"
+
+
 def _synth(args: argparse.Namespace, outdir: str) -> None:
     """Build the cdk.App in-process and synth into ``outdir``."""
     import aws_cdk as cdk
@@ -110,16 +113,36 @@ def _synth(args: argparse.Namespace, outdir: str) -> None:
             f"Set AWS credentials (e.g. `aws sso login` or `AWS_PROFILE=<profile>`) and retry."
         )
 
+    docker_hub_secret_arn = getattr(args, "docker_hub_secret_arn", None) or _discover_dockerhub_secret(args.region)
+
     app = cdk.App(outdir=outdir)
     HarborAWSStack(
         app,
         args.stack_name,
         env=cdk.Environment(account=account, region=args.region),
         cluster_admin_role_arn=getattr(args, "cluster_admin_role_arn", None),
-        docker_hub_secret_arn=getattr(args, "docker_hub_secret_arn", None),
+        docker_hub_secret_arn=docker_hub_secret_arn,
         cross_account_caller_ids=getattr(args, "cross_account_caller_ids", None),
     )
     app.synth()
+
+
+def _discover_dockerhub_secret(region: str) -> str | None:
+    """Look up the Docker Hub secret by name."""
+    import boto3
+    from botocore.exceptions import ClientError
+
+    try:
+        resp = boto3.client("secretsmanager", region_name=region).describe_secret(
+            SecretId=_DOCKERHUB_SECRET_NAME,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            return None
+        raise
+    arn: str = resp["ARN"]
+    print(f"using Docker Hub secret: {arn}")
+    return arn
 
 
 def _run_cdk(cdk_args: list[str]) -> None:

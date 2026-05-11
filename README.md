@@ -36,17 +36,13 @@ Creates VPC, EKS, control pod, NLB. Outputs `HarborAdminToken` + NLB DNS on comp
 
 ### 2. (Recommended at scale) ECR pull-through cache
 
-Anonymous Docker Hub pulls are rate-limited (~100/6h per IP); Fargate pods share one NAT, so >100 concurrent trials hit `ImagePullBackOff`. Route pulls through an ECR pull-through cache:
+Docker Hub rate-limits anonymous pulls (~100/6h per IP) and all Fargate pods share one NAT. The secret lets ECR mirror Docker Hub in-VPC so thousands of pods reuse one upstream pull. Create it any time — `harbor-aws deploy` (or a re-deploy) picks it up automatically:
 
 ```bash
 aws secretsmanager create-secret \
   --name ecr-pullthroughcache/docker-hub \
-  --secret-string '{"username":"<user>","accessToken":"<token>"}'   # any Docker Hub account (free works)
-
-harbor-aws deploy --docker-hub-secret-arn <secret-arn>
+  --secret-string '{"username":"<user>","accessToken":"<token>"}'
 ```
-
-Then pass `--ek ecr_cache=true` to `harbor jobs` (step 3).
 
 ### 3. Run benchmarks
 
@@ -60,7 +56,6 @@ harbor jobs start \
   -a terminus-2 \
   -m bedrock/us.anthropic.claude-sonnet-4-6-v1:0 \
   --environment-import-path harbor_aws.adapter:AWSEnvironment \
-  --ek ecr_cache=true \
   -n 89
 ```
 

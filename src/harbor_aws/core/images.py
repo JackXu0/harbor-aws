@@ -131,12 +131,11 @@ async def resolve_image(
     task_env_config: EnvironmentConfig,
     cluster: ClusterConfig,
     logger: logging.Logger,
-    *,
-    ecr_cache: bool = False,
 ) -> tuple[str, list[str]]:
 
     image_uri, setup_cmds = await _resolve_image_uri(environment_dir, task_env_config, cluster, logger)
-    if ecr_cache:
+
+    if cluster.dockerhub_cache_enabled:
         image_uri = _ecr_image_uri(image_uri, cluster, logger)
     return image_uri, setup_cmds
 

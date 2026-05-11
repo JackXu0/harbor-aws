@@ -98,7 +98,6 @@ class AWSEnvironment(BaseEnvironment):
         role_arn: str | None = None,
         stack_name: str = "harbor-aws",
         bedrock: bool = False,
-        ecr_cache: bool = False,
         cpus: int | None = None,
         memory_mb: int | None = None,
         pod_timeout_sec: int = 14400,
@@ -121,7 +120,6 @@ class AWSEnvironment(BaseEnvironment):
         self.stack_name = stack_name
 
         self.trial_options = TrialOptions(
-            ecr_cache=ecr_cache,
             pod_timeout_sec=int(pod_timeout_sec),
             use_bedrock=bedrock,
         )
@@ -147,7 +145,6 @@ class AWSEnvironment(BaseEnvironment):
 
         image_uri, dockerfile_commands = await images.resolve_image(
             self.environment_dir, self.task_env_config, self.cluster_config, self.logger,
-            ecr_cache=self.trial_options.ecr_cache,
         )
 
         pod_cpus = self.cpus_override or self.task_env_config.cpus
