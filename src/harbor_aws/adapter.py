@@ -253,6 +253,15 @@ class AWSEnvironment(BaseEnvironment):
             raise RuntimeError("Pod not running. Call start() first.")
         await self.remote_shell.download_dir(source_dir, target_dir)
 
+    async def attach(self) -> None:
+        if not self.pod_name or not self.cluster_config:
+            raise RuntimeError("attach: pod not running")
+        os.execvp("kubectl", [
+            "kubectl", "exec", "-it",
+            "-n", self.cluster_config.namespace,
+            self.pod_name, "--", "/bin/bash",
+        ])
+
     # -- BaseEnvironment capability declarations ---------------------------
 
     @staticmethod
