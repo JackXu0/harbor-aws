@@ -146,14 +146,11 @@ class RemoteShell:
         local = Path(local_path)
         if not local.exists():
             raise FileNotFoundError(local)
-        b64 = self._tar_b64([(local, local.name)])
-        # Extract into the parent dir of remote_path then mv to the final name,
-        # since the tar contains a single entry named local.name.
         remote = Path(remote_path)
+        b64 = self._tar_b64([(local, remote.name)])
         cmd = (
             f"mkdir -p {_q(str(remote.parent))} && "
-            f"echo {_q(b64)} | base64 -d | tar xzf - -C {_q(str(remote.parent))} && "
-            f"mv {_q(str(remote.parent / local.name))} {_q(remote_path)}"
+            f"echo {_q(b64)} | base64 -d | tar xzf - -C {_q(str(remote.parent))}"
         )
         _, err, rc = await self.run(cmd, timeout_sec=300)
         if rc != 0:
