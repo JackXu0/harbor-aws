@@ -83,6 +83,8 @@ class AdapterRuntime:
 
 runtime = AdapterRuntime()
 
+RUNNER_AUTH_TIMEOUT_SEC = 60.0
+
 
 class AWSEnvironment(BaseEnvironment):
 
@@ -181,7 +183,13 @@ class AWSEnvironment(BaseEnvironment):
                 )
 
             await pods.wait_for_pod_running(self.cluster_config.namespace, self.pod_name)
-            await register_task
+            try:
+                await asyncio.wait_for(register_task, timeout=RUNNER_AUTH_TIMEOUT_SEC)
+            except TimeoutError:
+                raise RuntimeError(
+                    f"Pod {self.pod_name} is Running but runner did not authenticate within "
+                    f"{RUNNER_AUTH_TIMEOUT_SEC:.0f}s — check runner.sh and the harbor-runner ConfigMap"
+                ) from None
         except Exception:
             register_task.cancel()
             raise
