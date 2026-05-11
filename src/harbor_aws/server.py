@@ -10,6 +10,7 @@ import os
 import resource
 import secrets
 import shlex
+import ssl
 import uuid
 from dataclasses import dataclass, field
 
@@ -44,6 +45,8 @@ class ControlServer:
         self.api_port = int(os.environ["HARBOR_CONTROL_PORT"])
         self.runner_port = int(os.environ["HARBOR_RUNNER_PORT"])
         self.bearer_token = os.environ["HARBOR_BEARER_TOKEN"]
+        self.tls_cert_file = os.environ["HARBOR_TLS_CERT_FILE"]
+        self.tls_key_file = os.environ["HARBOR_TLS_KEY_FILE"]
         self.trials: dict[str, _TrialConn] = {}
         self.trials_lock = asyncio.Lock()
 
@@ -55,9 +58,11 @@ class ControlServer:
         app.router.add_post("/stop", self._handle_stop)
         self.api_runner = web.AppRunner(app, access_log=None)
         await self.api_runner.setup()
-        site = web.TCPSite(self.api_runner, self.host, self.api_port)
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(certfile=self.tls_cert_file, keyfile=self.tls_key_file)
+        site = web.TCPSite(self.api_runner, self.host, self.api_port, ssl_context=ssl_ctx)
         await site.start()
-        logger.info("control API listening on %s:%d", self.host, self.api_port)
+        logger.info("control API listening on %s:%d (TLS)", self.host, self.api_port)
         
         self.trial_tcp_server = await asyncio.start_server(
             self._handle_runner_connection,

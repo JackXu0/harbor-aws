@@ -1,5 +1,7 @@
 """CDK stack for harbor-aws EKS/Fargate infrastructure"""
 
+import base64
+import datetime
 import os
 import secrets
 
@@ -11,6 +13,10 @@ from aws_cdk import aws_eks as eks
 from aws_cdk import aws_iam as iam
 from aws_cdk.lambda_layer_kubectl_v33 import KubectlV33Layer
 from constructs import Construct
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 APP_LABEL = "harbor-control"
 API_PORT = 8443
@@ -59,6 +65,7 @@ class HarborAWSStack(cdk.Stack):
 
         namespace = "harbor"
         bearer_token = secrets.token_urlsafe(32)
+        tls_cert_pem, tls_key_pem = _generate_self_signed_cert()
 
         # ============================================================
         # VPC — public + private subnets, 1 NAT for outbound (~$32/mo).
@@ -248,6 +255,22 @@ class HarborAWSStack(cdk.Stack):
         )
         runner_configmap.node.add_dependency(harbor_ns)
 
+        # TLS cert/key for the control pod's HTTPS API (port 8443).
+        tls_secret = cluster.add_manifest(
+            "HarborControlTLSSecret",
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "kubernetes.io/tls",
+                "metadata": {"name": "harbor-control-tls", "namespace": namespace},
+                "data": {
+                    "tls.crt": base64.b64encode(tls_cert_pem.encode()).decode(),
+                    "tls.key": base64.b64encode(tls_key_pem.encode()).decode(),
+                },
+            },
+        )
+        tls_secret.node.add_dependency(harbor_ns)
+
         # control pod Deployment (the in-VPC gateway).
         control_pod_deploy = cluster.add_manifest(
             "HarborControlDeployment",
@@ -265,23 +288,32 @@ class HarborAWSStack(cdk.Stack):
                                 "name": APP_LABEL,
                                 "image": control_pod_image.image_uri,
                                 "ports": [
-                                    {"containerPort": API_PORT, "name": "http-api"},
+                                    {"containerPort": API_PORT, "name": "https-api"},
                                     {"containerPort": RUNNER_PORT, "name": "runner-accept"},
                                 ],
                                 "env": [
                                     {"name": "HARBOR_BEARER_TOKEN", "value": bearer_token},
                                     {"name": "HARBOR_CONTROL_PORT", "value": str(API_PORT)},
                                     {"name": "HARBOR_RUNNER_PORT", "value": str(RUNNER_PORT)},
+                                    {"name": "HARBOR_TLS_CERT_FILE", "value": "/tls/tls.crt"},
+                                    {"name": "HARBOR_TLS_KEY_FILE", "value": "/tls/tls.key"},
+                                ],
+                                "volumeMounts": [
+                                    {"name": "tls", "mountPath": "/tls", "readOnly": True},
                                 ],
                                 "resources": {
                                     "requests": {"cpu": "16", "memory": "120Gi"},
                                     "limits": {"cpu": "16", "memory": "120Gi"},
                                 },
                                 "readinessProbe": {
-                                    "httpGet": {"path": "/healthz", "port": API_PORT},
+                                    # scheme=HTTPS; kubelet skips cert verification for self-signed.
+                                    "httpGet": {"path": "/healthz", "port": API_PORT, "scheme": "HTTPS"},
                                     "initialDelaySeconds": 5,
                                 },
                             }],
+                            "volumes": [
+                                {"name": "tls", "secret": {"secretName": "harbor-control-tls"}},
+                            ],
                         },
                     },
                 },
@@ -289,6 +321,7 @@ class HarborAWSStack(cdk.Stack):
         )
         control_pod_deploy.node.add_dependency(harbor_ns)
         control_pod_deploy.node.add_dependency(runner_configmap)
+        control_pod_deploy.node.add_dependency(tls_secret)
 
         # ClusterIP Service — runner pods dial port 8444 via in-cluster DNS.
         runner_svc = cluster.add_manifest(
@@ -300,7 +333,7 @@ class HarborAWSStack(cdk.Stack):
                 "spec": {
                     "selector": {"app": APP_LABEL},
                     "ports": [
-                        {"port": API_PORT, "targetPort": API_PORT, "name": "http-api"},
+                        {"port": API_PORT, "targetPort": API_PORT, "name": "https-api"},
                         {"port": RUNNER_PORT, "targetPort": RUNNER_PORT, "name": "runner-accept"},
                     ],
                     "type": "ClusterIP",
@@ -439,3 +472,30 @@ class HarborAWSStack(cdk.Stack):
         cdk.CfnOutput(self, "Namespace", value=namespace)
         cdk.CfnOutput(self, "PodServiceAccount", value=pod_sa.service_account_name)
         cdk.CfnOutput(self, "HarborAdminToken", value=bearer_token)
+        cdk.CfnOutput(self, "HarborNlbCert", value=tls_cert_pem)
+
+
+def _generate_self_signed_cert() -> tuple[str, str]:
+    """Generate a self-signed RSA cert + key for the control pod's HTTPS API."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "harbor-aws-control"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return cert_pem, key_pem

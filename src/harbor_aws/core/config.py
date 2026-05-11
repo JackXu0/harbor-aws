@@ -39,6 +39,9 @@ class ClusterConfig:
     # Stack-based configuration
     stack_name: str | None = None
 
+    # Pinned TLS cert for the control pod's HTTPS API (self-signed, from stack output).
+    nlb_cert_pem: str = ""
+
     def validate(self) -> None:
         """Validate that required fields are set."""
         if not self.eks_cluster_name:
@@ -162,6 +165,7 @@ async def load_config_from_stack(
         namespace=_required(outputs, "Namespace", stack_name),
         k8s_service_account=outputs.get("PodServiceAccount"),  # optional — only used when bedrock=True
         account_id=account_id,
+        nlb_cert_pem=_required(outputs, "HarborNlbCert", stack_name),
     )
 
     config.validate()

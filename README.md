@@ -51,7 +51,7 @@ Then pass `--ek ecr_cache=true` to `harbor jobs` (step 3).
 ### 3. Run benchmarks
 
 ```bash
-export HARBOR_NLB_URL=http://<nlb-dns>:8443
+export HARBOR_NLB_URL=https://<nlb-dns>:8443
 export HARBOR_BEARER_TOKEN=<bearer-token>
 
 # Example: terminal-bench with terminus-2 + Sonnet 4.6 via Bedrock, 89 concurrent trials.

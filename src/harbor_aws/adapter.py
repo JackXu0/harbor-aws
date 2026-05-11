@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import secrets
+import ssl
 from pathlib import Path
 
 import aiohttp
@@ -52,9 +53,13 @@ class AdapterRuntime:
         cluster = await load_config_from_stack(
             stack_name=stack_name, region=region, role_arn=role_arn,
         )
-        
         self.k8s_api = create_k8s_client(cluster)
         await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
+
+        ssl_ctx = ssl.create_default_context(cadata=cluster.nlb_cert_pem)
+        ssl_ctx.check_hostname = False
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=ssl_ctx)
+        self.session = aiohttp.ClientSession(connector=connector)
         return cluster
 
     def get_k8s_client(self, cluster: ClusterConfig) -> client.CoreV1Api:
@@ -72,8 +77,7 @@ class AdapterRuntime:
 
     def get_session(self) -> aiohttp.ClientSession:
         if self.session is None:
-            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
-            self.session = aiohttp.ClientSession(connector=connector)
+            raise RuntimeError("AdapterRuntime.get_session() called before bootstrap")
         return self.session
 
 
