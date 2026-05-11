@@ -28,8 +28,8 @@ npm install -g aws-cdk
 ### 1. Deploy (~15 min, one-time)
 
 ```bash
-cdk bootstrap                                  
-harbor-aws deploy --region us-east-1
+cdk bootstrap
+harbor-aws deploy
 ```
 
 Creates VPC, EKS, control pod, NLB. Outputs `HarborAdminToken` + NLB DNS on completion.
