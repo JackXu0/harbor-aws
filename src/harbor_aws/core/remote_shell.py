@@ -108,11 +108,19 @@ class RemoteShell:
         async with self._session.post(
             f"{self._nlb_url}/exec", json=body, headers=self._headers
         ) as resp:
-            payload = await resp.json()
-            if resp.status != 200:
+            if resp.status == 413:
+                # Payload exceeded the control server's MAX_PAYLOAD_BYTES cap.
+                # This is an infra/config bug — surface it loudly rather than
+                # letting a downstream ContentTypeError mask the real cause.
                 raise RuntimeError(
-                    f"control server exec failed ({resp.status}): {payload}"
+                    f"control server rejected /exec body as too large (413). "
+                    f"Payload exceeded MAX_PAYLOAD_BYTES (see server.py). "
+                    f"Either reduce the upload size or raise the cap + redeploy."
                 )
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"control server exec failed ({resp.status}): {text}")
+            payload = await resp.json()
             return (
                 payload.get("stdout", ""),
                 payload.get("stderr", ""),
@@ -121,10 +129,9 @@ class RemoteShell:
 
     # --- file transfer ---
     #
-    # Both directions use tar+base64 over a single run() call. The runner's
-    # message frame is capped at 64 MB; base64 inflates 4/3, so we can transfer
-    # roughly 48 MB of payload per call. For larger transfers we'd need to
-    # chunk, which we don't currently need for any harbor workload.
+    # Both directions use tar+base64 over a single run() call. The control
+    # pod caps request bodies at MAX_PAYLOAD_BYTES (see server.py); base64
+    # inflates 4/3, so usable payload per call is roughly 3/4 of that.
 
     @staticmethod
     def _tar_b64(entries: list[tuple[Path, str]]) -> str:
