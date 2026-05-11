@@ -253,8 +253,14 @@ class ControlServer:
             return web.json_response({"error": "timeout_sec must be an integer"}, status=400)
 
         t = self.trials.get(trial_id)
-        if t is None or t.closed:
-            return web.json_response({"error": "unknown trial"}, status=404)
+        if t is None:
+            return web.json_response(
+                {"error": "unknown trial", "reason": "not_registered"}, status=404,
+            )
+        if t.closed:
+            return web.json_response(
+                {"error": "trial closed", "reason": "runner_disconnected"}, status=404,
+            )
 
         wrapped = _wrap_command(cmd, cwd=cwd, env=env)
         b64_cmd = base64.b64encode(wrapped.encode("utf-8")).decode("ascii")
