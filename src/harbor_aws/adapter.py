@@ -257,7 +257,8 @@ class AWSEnvironment(BaseEnvironment):
 
     @staticmethod
     def type() -> EnvironmentType:
-        return EnvironmentType("eks")
+        # TODO: switch to EnvironmentType.EKS once https://github.com/harbor-framework/harbor/pull/1634 lands.
+        return EnvironmentType.DOCKER
 
     @property
     def is_mounted(self) -> bool:
