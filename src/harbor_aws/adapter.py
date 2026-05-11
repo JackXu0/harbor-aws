@@ -213,8 +213,9 @@ class AWSEnvironment(BaseEnvironment):
     ) -> ExecResult:
         if self.remote_shell is None:
             raise RuntimeError("Pod not running. Call start() first.")
-        if user is not None:
-            raise NotImplementedError("AWSEnvironment.exec(user=...) is not supported")
+            
+        if user is not None and user not in ("root", 0, "0"):
+            raise NotImplementedError(f"AWSEnvironment.exec(user={user!r}) is not supported")
         stdout, stderr, return_code = await self.remote_shell.run(
             command, cwd=cwd, env=env, timeout_sec=timeout_sec or 900,
         )
