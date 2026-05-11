@@ -228,16 +228,19 @@ class ControlServer:
         logger.info("register: pre-registered trial %s, waiting for runner...", trial_id)
 
         try:
-            await asyncio.wait_for(t.runner_connected.wait(), timeout=connect_timeout)
-        except TimeoutError:
-            async with self.trials_lock:
-                self.trials.pop(trial_id, None)
-            logger.warning("register: trial %s timed out after %.0fs", trial_id, connect_timeout)
-            return web.json_response(
-                {"error": f"runner did not connect within {connect_timeout}s"}, status=504
-            )
-        logger.info("register: trial %s ready", trial_id)
-        return web.json_response({"ok": True})
+            try:
+                await asyncio.wait_for(t.runner_connected.wait(), timeout=connect_timeout)
+            except TimeoutError:
+                logger.warning("register: trial %s timed out after %.0fs", trial_id, connect_timeout)
+                return web.json_response(
+                    {"error": f"runner did not connect within {connect_timeout}s"}, status=504
+                )
+            logger.info("register: trial %s ready", trial_id)
+            return web.json_response({"ok": True})
+        finally:
+            if not t.runner_connected.is_set():
+                async with self.trials_lock:
+                    self.trials.pop(trial_id, None)
 
     async def _handle_exec(self, request: web.Request) -> web.Response:
         if not self._check_admin(request):
