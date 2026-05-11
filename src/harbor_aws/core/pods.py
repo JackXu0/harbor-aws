@@ -139,7 +139,7 @@ async def delete_pod(api: client.CoreV1Api, namespace: str, pod_name: str) -> No
         if e.status != 404:
             raise
 
-    PodWatcher.unregister_if_active(pod_name)
+    PodWatcher.unregister(pod_name)
 
 
 async def list_pods(api: client.CoreV1Api, namespace: str) -> list[str]:
