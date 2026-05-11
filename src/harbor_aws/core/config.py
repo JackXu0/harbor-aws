@@ -51,17 +51,30 @@ class ClusterConfig:
             )
 
     def create_boto3_session(self) -> boto3.Session:
-        """Create a boto3 session, assuming role_arn if provided (cross-account)."""
-        if self.role_arn:
-            sts = boto3.client("sts", region_name=self.region)
-            creds = sts.assume_role(RoleArn=self.role_arn, RoleSessionName="harbor-aws")["Credentials"]
-            return boto3.Session(
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-                region_name=self.region,
-            )
-        return boto3.Session(region_name=self.region)
+        """Create a boto3 session, assuming role_arn if provided (cross-account)"""
+        if not self.role_arn:
+            return boto3.Session(region_name=self.region)
+
+        sts = boto3.client("sts", region_name=self.region)
+        
+        try:
+            caller_arn = sts.get_caller_identity()["Arn"]
+            target_account = self.role_arn.split(":")[4]
+            target_role_name = self.role_arn.rsplit("/", 1)[-1]
+            if (f"::{target_account}:" in caller_arn
+                    and f":assumed-role/{target_role_name}/" in caller_arn):
+                logger.debug("Already in target role %s, skipping AssumeRole", self.role_arn)
+                return boto3.Session(region_name=self.region)
+        except Exception:
+            logger.debug("Caller identity check failed; proceeding with AssumeRole", exc_info=True)
+
+        creds = sts.assume_role(RoleArn=self.role_arn, RoleSessionName="harbor-aws")["Credentials"]
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            region_name=self.region,
+        )
 
     def _cli_env(self) -> dict[str, str] | None:
         """Environment variables for running AWS CLI with cross-account credentials."""
