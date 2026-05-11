@@ -213,7 +213,7 @@ class ControlServer:
         token = body.get("token")
         if not trial_id or not token:
             return web.json_response({"error": "missing trial_id or token"}, status=400)
-        connect_timeout = float(body["connect_timeout"])
+        connect_timeout = float(body.get("connect_timeout", 600))
 
         t = _TrialConn(trial_id=trial_id, trial_token=token)
         async with self.trials_lock:

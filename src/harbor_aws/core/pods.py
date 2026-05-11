@@ -19,6 +19,23 @@ RUNNER_CONFIGMAP = "harbor-runner"
 
 EXECUTABLE_MODE = 0o755
 
+
+def validate_runner_configmap(api: client.CoreV1Api, namespace: str) -> None:
+    """Verify the runner ConfigMap exists before any pod is created.
+
+    If missing, trial pods would hang in ContainerCreating until the wait
+    timeout (~1800s) with no actionable error. Surface it loudly at startup.
+    """
+    try:
+        api.read_namespaced_config_map(name=RUNNER_CONFIGMAP, namespace=namespace)
+    except client.ApiException as e:
+        if e.status == 404:
+            raise RuntimeError(
+                f"ConfigMap '{RUNNER_CONFIGMAP}' not found in namespace '{namespace}'. "
+                f"Redeploy with: harbor-aws deploy"
+            ) from e
+        raise
+
 # Bootstrap script for the pod's PID 1. Probes for bash and installs it via
 # apk on Alpine if missing (the runner needs bash for /dev/tcp). Then exec's
 # the bash runner. Uses POSIX sh so it works even on Alpine where /bin/sh is

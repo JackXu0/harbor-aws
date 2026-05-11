@@ -3,7 +3,6 @@
 Commands:
     deploy   - Deploy the harbor-aws CDK stack (one-shot, no scaffolding)
     destroy  - Tear down the harbor-aws stack
-    status   - Check if infrastructure is deployed
     stop     - Delete all running pods (keeps infrastructure)
 """
 
@@ -57,11 +56,6 @@ def main() -> None:
     _add_cdk_args(destroy_p)
     destroy_p.add_argument("--force", action="store_true", help="skip confirmation prompt")
 
-    status_p = sub.add_parser("status", help="check infrastructure status")
-    status_p.add_argument("--stack-name", default="harbor-aws")
-    status_p.add_argument("--region", default="us-east-1")
-    status_p.add_argument("--profile", default=None)
-
     stop_p = sub.add_parser("stop", help="delete all running pods (keeps infrastructure)")
     stop_p.add_argument("--stack-name", default="harbor-aws")
     stop_p.add_argument("--region", default="us-east-1")
@@ -84,7 +78,6 @@ def main() -> None:
     commands = {
         "deploy": _deploy,
         "destroy": _destroy,
-        "status": _status,
         "stop": _stop,
     }
     if args.command in commands:
@@ -103,17 +96,25 @@ def _add_cdk_args(p: argparse.ArgumentParser) -> None:
 def _synth(args: argparse.Namespace, outdir: str) -> None:
     """Build the cdk.App in-process and synth into ``outdir``."""
     import aws_cdk as cdk
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
     from harbor_aws.cdk.stack import HarborAWSStack
+
+    # Derive account from STS
+    try:
+        account = boto3.client("sts", region_name=args.region).get_caller_identity()["Account"]
+    except (BotoCoreError, ClientError, NoCredentialsError) as e:
+        sys.exit(
+            f"failed to read AWS account ID via STS: {e}\n"
+            f"Set AWS credentials (e.g. `aws sso login` or `AWS_PROFILE=<profile>`) and retry."
+        )
 
     app = cdk.App(outdir=outdir)
     HarborAWSStack(
         app,
         args.stack_name,
-        env=cdk.Environment(
-            account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
-            region=args.region,
-        ),
+        env=cdk.Environment(account=account, region=args.region),
         cluster_admin_role_arn=getattr(args, "cluster_admin_role_arn", None),
         docker_hub_secret_arn=getattr(args, "docker_hub_secret_arn", None),
         cross_account_caller_ids=getattr(args, "cross_account_caller_ids", None),
@@ -147,29 +148,6 @@ def _destroy(args: argparse.Namespace) -> None:
         if args.force:
             cdk_args.append("--force")
         _run_cdk(cdk_args)
-
-
-def _status(args: argparse.Namespace) -> None:
-    import boto3
-
-    session = boto3.Session(region_name=args.region)
-    cfn = session.client("cloudformation")
-
-    try:
-        response = cfn.describe_stacks(StackName=args.stack_name)
-        stack = response["Stacks"][0]
-        print(f"Stack: {args.stack_name}")
-        print(f"Status: {stack['StackStatus']}")
-        print(f"Region: {args.region}")
-        if stack.get("Outputs"):
-            print("\nOutputs:")
-            for o in stack["Outputs"]:
-                print(f"  {o['OutputKey']}: {o['OutputValue']}")
-    except Exception as e:
-        if "does not exist" in str(e):
-            print(f"Stack '{args.stack_name}' does not exist in {args.region}.")
-        else:
-            raise
 
 
 def _stop(args: argparse.Namespace) -> None:

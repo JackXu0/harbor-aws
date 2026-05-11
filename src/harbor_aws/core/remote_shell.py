@@ -121,11 +121,8 @@ class RemoteShell:
                 text = await resp.text()
                 raise RuntimeError(f"control server exec failed ({resp.status}): {text}")
             payload = await resp.json()
-            return (
-                payload.get("stdout", ""),
-                payload.get("stderr", ""),
-                int(payload.get("rc", 1)),
-            )
+            
+            return payload["stdout"], payload["stderr"], int(payload["rc"])
 
     # --- file transfer ---
     #

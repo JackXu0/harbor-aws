@@ -39,9 +39,6 @@ class ClusterConfig:
     # Stack-based configuration
     stack_name: str | None = None
 
-    # Control plane bearer token (from stack output)
-    bearer_token: str | None = None
-
     def validate(self) -> None:
         """Validate that required fields are set."""
         if not self.eks_cluster_name:
@@ -161,12 +158,21 @@ async def load_config_from_stack(
         region=region,
         role_arn=role_arn,
         stack_name=stack_name,
-        eks_cluster_name=outputs.get("EksClusterName", "harbor-aws"),
-        namespace=outputs.get("Namespace", "harbor"),
-        k8s_service_account=outputs.get("PodServiceAccount"),
+        eks_cluster_name=_required(outputs, "EksClusterName", stack_name),
+        namespace=_required(outputs, "Namespace", stack_name),
+        k8s_service_account=outputs.get("PodServiceAccount"),  # optional — only used when bedrock=True
         account_id=account_id,
-        bearer_token=outputs.get("HarborAdminToken"),
     )
 
     config.validate()
     return config
+
+
+def _required(outputs: dict[str, str], key: str, stack_name: str) -> str:
+    """Read a CloudFormation output that must exist on a healthy deploy."""
+    if key not in outputs:
+        raise RuntimeError(
+            f"Stack '{stack_name}' is missing required output '{key}'. "
+            f"Redeploy with the current harbor-aws CDK: harbor-aws deploy --stack-name {stack_name}"
+        )
+    return outputs[key]

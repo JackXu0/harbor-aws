@@ -42,9 +42,20 @@ class AdapterRuntime:
     ) -> ClusterConfig:
         if self.cluster_config_task is None:
             self.cluster_config_task = asyncio.create_task(
-                load_config_from_stack(stack_name=stack_name, region=region, role_arn=role_arn)
+                self._bootstrap(stack_name, region, role_arn)
             )
         return await self.cluster_config_task
+
+    async def _bootstrap(
+        self, stack_name: str, region: str, role_arn: str | None,
+    ) -> ClusterConfig:
+        cluster = await load_config_from_stack(
+            stack_name=stack_name, region=region, role_arn=role_arn,
+        )
+        
+        self.k8s_api = create_k8s_client(cluster)
+        await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
+        return cluster
 
     def get_k8s_client(self, cluster: ClusterConfig) -> client.CoreV1Api:
         if self.k8s_api is None:
