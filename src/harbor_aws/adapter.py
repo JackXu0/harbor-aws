@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import secrets
+import socket
 import ssl
 from pathlib import Path
 
@@ -58,9 +59,26 @@ class AdapterRuntime:
         await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
         self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, self.k8s_api, cluster.namespace)
 
+        # TCP keepalive so AWS NLB's ~350s idle timeout doesn't drop long /exec calls.
+        def keepalive_socket(addr_info: tuple) -> socket.socket:  # type: ignore[type-arg]
+            family, type_, proto, *_ = addr_info
+            s = socket.socket(family, type_, proto)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 30), ("TCP_KEEPCNT", 4)):
+                const = getattr(socket, name, None)
+                if const is not None:
+                    s.setsockopt(socket.IPPROTO_TCP, const, value)
+            return s
+
+        # For HTTPS
         ssl_ctx = ssl.create_default_context(cadata=cluster.nlb_cert_pem)
         ssl_ctx.check_hostname = False
-        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=ssl_ctx)
+        connector = aiohttp.TCPConnector(
+            limit=0,
+            limit_per_host=0,
+            ssl=ssl_ctx,
+            socket_factory=keepalive_socket,
+        )
         self.session = aiohttp.ClientSession(connector=connector)
         return cluster
 
