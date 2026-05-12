@@ -32,7 +32,7 @@ cdk bootstrap
 harbor-aws deploy
 ```
 
-Creates VPC, EKS, control pod, NLB. Outputs `HarborAdminToken` + NLB DNS on completion.
+Creates VPC, EKS, control pod, NLB.
 
 ### 2. (Recommended at scale) ECR pull-through cache
 
@@ -47,9 +47,6 @@ aws secretsmanager create-secret \
 ### 3. Run benchmarks
 
 ```bash
-export HARBOR_NLB_URL=https://<nlb-dns>:8443
-export HARBOR_BEARER_TOKEN=<bearer-token>
-
 # Example: terminal-bench with terminus-2 + Sonnet 4.6 via Bedrock, 89 concurrent trials.
 harbor jobs start \
   --task-git-url https://github.com/laude-institute/terminal-bench \

@@ -42,6 +42,9 @@ class ClusterConfig:
     # Pinned TLS cert for the control pod's HTTPS API (self-signed, from stack output).
     nlb_cert_pem: str = ""
 
+    # Bearer token for the control pod's HTTPS API (from stack output).
+    bearer_token: str = ""
+
     # Whether the ECR pull-through cache for Docker Hub was wired up at deploy.
     # When true, the image resolver rewrites Docker Hub URIs to use the cache.
     dockerhub_cache_enabled: bool = False
@@ -167,6 +170,7 @@ async def load_config_from_stack(
         k8s_service_account=outputs.get("PodServiceAccount"),  # optional — only used when bedrock=True
         account_id=account_id,
         nlb_cert_pem=_required(outputs, "HarborNlbCert", stack_name),
+        bearer_token=_required(outputs, "HarborAdminToken", stack_name),
         dockerhub_cache_enabled=_required(outputs, "DockerHubCacheEnabled", stack_name) == "true",
     )
 

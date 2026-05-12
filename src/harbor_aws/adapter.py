@@ -36,6 +36,7 @@ class AdapterRuntime:
         self.cluster_config_task: asyncio.Task[ClusterConfig] | None = None
         self.k8s_api: client.CoreV1Api | None = None
         self.session: aiohttp.ClientSession | None = None
+        self.nlb_url: str | None = None
         self.create_semaphore = asyncio.Semaphore(100)
 
     async def get_cluster_config(
@@ -55,6 +56,7 @@ class AdapterRuntime:
         )
         self.k8s_api = create_k8s_client(cluster)
         await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
+        self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, self.k8s_api, cluster.namespace)
 
         ssl_ctx = ssl.create_default_context(cadata=cluster.nlb_cert_pem)
         ssl_ctx.check_hostname = False
@@ -68,12 +70,9 @@ class AdapterRuntime:
         return self.k8s_api
 
     def get_nlb_url(self) -> str:
-        """Return the control plane NLB URL from ``HARBOR_NLB_URL``."""
-        return os.environ["HARBOR_NLB_URL"]
-
-    def get_bearer_token(self) -> str:
-        """Return the control plane bearer token from ``HARBOR_BEARER_TOKEN``."""
-        return os.environ["HARBOR_BEARER_TOKEN"]
+        if self.nlb_url is None:
+            raise RuntimeError("AdapterRuntime.get_nlb_url() called before bootstrap")
+        return self.nlb_url
 
     def get_session(self) -> aiohttp.ClientSession:
         if self.session is None:
@@ -159,7 +158,7 @@ class AWSEnvironment(BaseEnvironment):
             trial_id=self.session_id,
             trial_token=trial_token,
             nlb_url=runtime.get_nlb_url(),
-            bearer_token=runtime.get_bearer_token(),
+            bearer_token=self.cluster_config.bearer_token,
             session=runtime.get_session(),
         )
 
