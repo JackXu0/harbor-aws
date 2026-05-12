@@ -1,9 +1,4 @@
-# harbor-control image — runs the in-cluster control gateway.
-#
-# The control gateway is a tiny aiohttp HTTP server (for the Mac side) plus
-# a TCP listener for inbound connections from runner pods. Pure Python with
-# one dep: aiohttp. The Dockerfile is intentionally minimal — no build steps,
-# no apt-get layer, fast rebuilds when server.py changes.
+# Image for the in-cluster control pod.
 FROM python:3.12-slim
 
 WORKDIR /app
