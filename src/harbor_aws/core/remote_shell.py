@@ -106,7 +106,10 @@ class RemoteShell:
             "timeout_sec": timeout_sec,
         }
         async with self._session.post(
-            f"{self._nlb_url}/exec", json=body, headers=self._headers
+            f"{self._nlb_url}/exec",
+            json=body,
+            headers=self._headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_sec + 30),
         ) as resp:
             if resp.status == 413:
                 # Payload exceeded the control server's MAX_PAYLOAD_BYTES cap.
