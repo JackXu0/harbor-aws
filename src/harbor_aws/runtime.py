@@ -71,7 +71,12 @@ class AdapterRuntime:
             ssl=ssl_ctx,
             socket_factory=keepalive_socket,
         )
-        self.session = aiohttp.ClientSession(connector=connector)
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=30),
+        )
+        
         return cluster
 
     def get_k8s_client(self, cluster: ClusterConfig) -> client.CoreV1Api:
