@@ -50,8 +50,12 @@ class AdapterRuntime:
         self.k8s_api = create_k8s_client(cluster)
         await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
         self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, self.k8s_api, cluster.namespace)
+        self.session = self._build_session(cluster.nlb_cert_pem)
+        return cluster
 
-        # TCP keepalive so AWS NLB's ~350s idle timeout doesn't drop long /exec calls.
+    @staticmethod
+    def _build_session(cert_pem: str) -> aiohttp.ClientSession:
+        """Shared aiohttp session with HTTPS + TCP keepalive."""
         def keepalive_socket(addr_info: tuple) -> socket.socket:  # type: ignore[type-arg]
             family, type_, proto, *_ = addr_info
             s = socket.socket(family, type_, proto)
@@ -62,22 +66,14 @@ class AdapterRuntime:
                     s.setsockopt(socket.IPPROTO_TCP, const, value)
             return s
 
-        # For HTTPS
-        ssl_ctx = ssl.create_default_context(cadata=cluster.nlb_cert_pem)
+        ssl_ctx = ssl.create_default_context(cadata=cert_pem)
         ssl_ctx.check_hostname = False
-        connector = aiohttp.TCPConnector(
-            limit=0,
-            limit_per_host=0,
-            ssl=ssl_ctx,
-            socket_factory=keepalive_socket,
-        )
-        
-        self.session = aiohttp.ClientSession(
-            connector=connector,
+        return aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(
+                limit=0, limit_per_host=0, ssl=ssl_ctx, socket_factory=keepalive_socket,
+            ),
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=30),
         )
-        
-        return cluster
 
     def get_k8s_client(self, cluster: ClusterConfig) -> client.CoreV1Api:
         if self.k8s_api is None:
