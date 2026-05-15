@@ -240,6 +240,59 @@ class HarborAWSStack(cdk.Stack):
         )
         control_pod_image.repository.grant_pull(cluster.default_profile.pod_execution_role)
 
+        control_pod_sa = cluster.add_manifest(
+            "HarborControlServiceAccount",
+            {
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": "harbor-control", "namespace": namespace},
+            },
+        )
+        control_pod_sa.node.add_dependency(harbor_ns)
+
+        control_pod_role = cluster.add_manifest(
+            "HarborControlRole",
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {"name": "harbor-control", "namespace": namespace},
+                "rules": [
+                    {
+                        "apiGroups": [""],
+                        "resources": ["pods", "pods/status"],
+                        "verbs": ["create", "delete", "get", "list", "watch"],
+                    },
+                    {
+                        "apiGroups": [""],
+                        "resources": ["secrets", "configmaps", "services"],
+                        "verbs": ["get", "list", "create"],
+                    },
+                ],
+            },
+        )
+        control_pod_role.node.add_dependency(harbor_ns)
+
+        control_pod_rb = cluster.add_manifest(
+            "HarborControlRoleBinding",
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "harbor-control", "namespace": namespace},
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "harbor-control",
+                    "namespace": namespace,
+                }],
+                "roleRef": {
+                    "kind": "Role",
+                    "name": "harbor-control",
+                    "apiGroup": "rbac.authorization.k8s.io",
+                },
+            },
+        )
+        control_pod_rb.node.add_dependency(control_pod_sa)
+        control_pod_rb.node.add_dependency(control_pod_role)
+
         # ConfigMap with runner.sh (mounted into every trial pod as PID 1).
         runner_sh_path = os.path.join(pkg_root, "runner.sh")
         with open(runner_sh_path) as f:
@@ -284,6 +337,7 @@ class HarborAWSStack(cdk.Stack):
                     "template": {
                         "metadata": {"labels": {"app": APP_LABEL}},
                         "spec": {
+                            "serviceAccountName": "harbor-control",
                             "containers": [{
                                 "name": APP_LABEL,
                                 "image": control_pod_image.image_uri,
@@ -297,6 +351,7 @@ class HarborAWSStack(cdk.Stack):
                                     {"name": "HARBOR_RUNNER_PORT", "value": str(RUNNER_PORT)},
                                     {"name": "HARBOR_TLS_CERT_FILE", "value": "/tls/tls.crt"},
                                     {"name": "HARBOR_TLS_KEY_FILE", "value": "/tls/tls.key"},
+                                    {"name": "HARBOR_NAMESPACE", "value": namespace},
                                 ],
                                 "volumeMounts": [
                                     {"name": "tls", "mountPath": "/tls", "readOnly": True},
@@ -322,6 +377,7 @@ class HarborAWSStack(cdk.Stack):
         control_pod_deploy.node.add_dependency(harbor_ns)
         control_pod_deploy.node.add_dependency(runner_configmap)
         control_pod_deploy.node.add_dependency(tls_secret)
+        control_pod_deploy.node.add_dependency(control_pod_rb)
 
         # ClusterIP Service — runner pods dial port 8444 via in-cluster DNS.
         runner_svc = cluster.add_manifest(

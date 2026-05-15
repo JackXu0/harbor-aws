@@ -11,15 +11,24 @@ import resource
 import secrets
 import shlex
 import ssl
+import time
 import uuid
 from dataclasses import dataclass, field
 
 from aiohttp import web
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+
+from harbor_aws.core import pods
 
 logger = logging.getLogger(__name__)
 
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
 RUNNER_MAX_FRAME_BYTES = 6 * 1024 * 1024 * 1024  # 6 GiB
+
+
+POD_CREATE_SEMAPHORE_SIZE = 100
+POD_CREATE_TIMEOUT_SEC = 60.0
 
 
 @dataclass
@@ -47,8 +56,13 @@ class ControlServer:
         self.bearer_token = os.environ["HARBOR_BEARER_TOKEN"]
         self.tls_cert_file = os.environ["HARBOR_TLS_CERT_FILE"]
         self.tls_key_file = os.environ["HARBOR_TLS_KEY_FILE"]
+        self.namespace = os.environ["HARBOR_NAMESPACE"]
         self.trials: dict[str, _TrialConn] = {}
         self.trials_lock = asyncio.Lock()
+
+        k8s_config.load_incluster_config()
+        self.k8s_api = k8s_client.CoreV1Api()
+        self.pod_create_semaphore = asyncio.Semaphore(POD_CREATE_SEMAPHORE_SIZE)
 
     async def start(self) -> None:
         app = web.Application(client_max_size=MAX_PAYLOAD_BYTES)
@@ -56,6 +70,7 @@ class ControlServer:
         app.router.add_post("/register", self._handle_register)
         app.router.add_post("/exec", self._handle_exec)
         app.router.add_post("/stop", self._handle_stop)
+        app.router.add_post("/create-pod", self._handle_create_pod)
         self.api_runner = web.AppRunner(app, access_log=None)
         await self.api_runner.setup()
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -310,6 +325,66 @@ class ControlServer:
             return web.json_response({"ok": True, "note": "not registered"})
         await self._close_trial_conn(t)
         return web.json_response({"ok": True})
+
+    async def _handle_create_pod(self, request: web.Request) -> web.Response:
+        """Create a trial pod, rate-limited by a global semaphore.
+
+        Returns immediately after the K8s API accepts the create — does NOT
+        wait for the pod to reach Running. The orchestrator does that
+        separately. The single purpose of this endpoint is to provide a
+        global rate limit on concurrent K8s create_pod calls across all
+        clients (the per-process semaphore in adapter.py was insufficient
+        for multi-process / multi-researcher scenarios).
+        """
+        if not self._check_admin(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return web.json_response({"error": "invalid json"}, status=400)
+
+        required = ("image_uri", "environment_name", "cpus", "memory_mb",
+                    "trial_id", "trial_token", "pod_timeout_sec")
+        missing = [k for k in required if body.get(k) is None]
+        if missing:
+            return web.json_response(
+                {"error": f"missing fields: {missing}"}, status=400,
+            )
+
+        t_queued = time.monotonic()
+        async with self.pod_create_semaphore:
+            wait_ms = (time.monotonic() - t_queued) * 1000
+            try:
+                pod_name = await asyncio.wait_for(
+                    pods.create_pod(
+                        self.k8s_api,
+                        namespace=self.namespace,
+                        image_uri=body["image_uri"],
+                        environment_name=body["environment_name"],
+                        cpus=int(body["cpus"]),
+                        memory_mb=int(body["memory_mb"]),
+                        trial_id=body["trial_id"],
+                        trial_token=body["trial_token"],
+                        pod_timeout_sec=int(body["pod_timeout_sec"]),
+                        service_account=body.get("service_account"),
+                    ),
+                    timeout=POD_CREATE_TIMEOUT_SEC,
+                )
+            except TimeoutError:
+                return web.json_response(
+                    {"error": f"K8s create_pod stuck > {POD_CREATE_TIMEOUT_SEC}s"},
+                    status=504,
+                )
+            except k8s_client.ApiException as e:
+                return web.json_response(
+                    {"error": f"K8s API error: {e.reason}"}, status=502,
+                )
+
+        logger.info(
+            "create_pod: trial=%s pod=%s queue_wait_ms=%.0f",
+            body["trial_id"], pod_name, wait_ms,
+        )
+        return web.json_response({"pod_name": pod_name})
 
 
 def _wrap_command(cmd: str, *, cwd: str | None, env: dict[str, str] | None) -> str:

@@ -19,18 +19,12 @@ from harbor_aws.core.config import ClusterConfig, create_k8s_client, load_config
 
 
 class AdapterRuntime:
-    """Process-wide cache shared across all AWSEnvironment instances.
-
-    Lazily resolves the CloudFormation stack config, K8s API client, control plane
-    NLB URL + bearer token, and aiohttp session on first use. All getters are idempotent.
-    """
 
     def __init__(self) -> None:
         self.cluster_config_task: asyncio.Task[ClusterConfig] | None = None
         self.k8s_api: client.CoreV1Api | None = None
         self.session: aiohttp.ClientSession | None = None
         self.nlb_url: str | None = None
-        self.create_semaphore = asyncio.Semaphore(100)
 
     async def get_cluster_config(
         self, stack_name: str, region: str, role_arn: str | None,

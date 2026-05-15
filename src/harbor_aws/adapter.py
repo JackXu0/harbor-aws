@@ -105,21 +105,16 @@ class AWSEnvironment(BaseEnvironment):
         register_task = asyncio.create_task(self.remote_shell.connect())
 
         try:
-            # Throttle pod creation to avoid K8s API contention.
-            async with runtime.create_semaphore:
-                service_account = self.cluster_config.k8s_service_account if self.trial_options.use_bedrock else None
-                self.pod_name = await pods.create_pod(
-                    runtime.get_k8s_client(self.cluster_config),
-                    self.cluster_config.namespace,
-                    image_uri,
-                    self.environment_name,
-                    cpus=pod_cpus,
-                    memory_mb=pod_memory,
-                    trial_id=self.session_id,
-                    trial_token=trial_token,
-                    pod_timeout_sec=self.trial_options.pod_timeout_sec,
-                    service_account=service_account,
-                )
+            service_account = self.cluster_config.k8s_service_account if self.trial_options.use_bedrock else None
+
+            self.pod_name = await self.remote_shell.create_pod(
+                image_uri=image_uri,
+                environment_name=self.environment_name,
+                cpus=pod_cpus,
+                memory_mb=pod_memory,
+                pod_timeout_sec=self.trial_options.pod_timeout_sec,
+                service_account=service_account,
+            )
 
             await pods.wait_for_pod_running(self.cluster_config.namespace, self.pod_name)
             try:
