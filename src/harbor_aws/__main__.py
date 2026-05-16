@@ -9,12 +9,15 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+
+_DOCKERHUB_SECRET_NAME = "ecr-pullthroughcache/docker-hub"
 
 
 def main() -> None:
@@ -91,9 +94,6 @@ def _add_cdk_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stack-name", default="harbor-aws")
     p.add_argument("--region", default="us-east-1")
     p.add_argument("--profile", default=None)
-
-
-_DOCKERHUB_SECRET_NAME = "ecr-pullthroughcache/docker-hub"
 
 
 def _synth(args: argparse.Namespace, outdir: str) -> None:
@@ -174,14 +174,10 @@ def _destroy(args: argparse.Namespace) -> None:
 
 
 def _stop(args: argparse.Namespace) -> None:
-    import asyncio
-
     asyncio.run(_async_stop(args))
 
 
 async def _async_stop(args: argparse.Namespace) -> None:
-    import asyncio
-
     from harbor_aws.runtime import runtime
 
     await runtime.get_cluster_config(args.stack_name, args.region, None)
