@@ -66,6 +66,7 @@ class ControlServer:
         k8s_config.load_incluster_config()
         self.k8s_api = k8s_client.CoreV1Api()
         self.pod_create_semaphore = asyncio.Semaphore(POD_CREATE_SEMAPHORE_SIZE)
+        self.pod_watcher: PodWatcher | None = None
 
         try:
             self.k8s_api.read_namespaced_config_map(name=RUNNER_CONFIGMAP, namespace=self.namespace)
@@ -78,6 +79,7 @@ class ControlServer:
             raise
 
     async def start(self) -> None:
+        self.pod_watcher = await PodWatcher.create(self.namespace)
         app = web.Application(client_max_size=MAX_PAYLOAD_BYTES)
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_post("/register", self._handle_register)
@@ -94,7 +96,7 @@ class ControlServer:
         site = web.TCPSite(self.api_runner, self.host, self.api_port, ssl_context=ssl_ctx)
         await site.start()
         logger.info("control API listening on %s:%d (TLS)", self.host, self.api_port)
-        
+
         self.trial_tcp_server = await asyncio.start_server(
             self._handle_runner_connection,
             self.host,
@@ -437,21 +439,16 @@ class ControlServer:
         pod_name = body.get("pod_name")
         if not pod_name:
             return web.json_response({"error": "missing pod_name"}, status=400)
-
-        watcher = await PodWatcher.get_or_create(self.namespace)
-        handle = watcher.register(pod_name)
         try:
-            await asyncio.wait_for(
-                handle.pod_running.wait(), timeout=WAIT_POD_RUNNING_TIMEOUT_SEC,
-            )
+            await self.pod_watcher.wait_pod_running(pod_name, timeout=WAIT_POD_RUNNING_TIMEOUT_SEC)
         except TimeoutError:
             return web.json_response(
                 {"error": f"pod {pod_name} did not become Running in "
                           f"{WAIT_POD_RUNNING_TIMEOUT_SEC:.0f}s"},
                 status=504,
             )
-        if handle.error is not None:
-            return web.json_response({"error": str(handle.error)}, status=502)
+        except RuntimeError as e:
+            return web.json_response({"error": str(e)}, status=502)
         return web.json_response({"ok": True})
 
 def _wrap_command(cmd: str, *, cwd: str | None, env: dict[str, str] | None) -> str:
