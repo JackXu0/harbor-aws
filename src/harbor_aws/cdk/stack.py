@@ -259,13 +259,8 @@ class HarborAWSStack(cdk.Stack):
                 "rules": [
                     {
                         "apiGroups": [""],
-                        "resources": ["pods", "pods/status"],
-                        "verbs": ["create", "delete", "get", "list", "watch"],
-                    },
-                    {
-                        "apiGroups": [""],
-                        "resources": ["secrets", "configmaps", "services"],
-                        "verbs": ["get", "list", "create"],
+                        "resources": ["pods"],
+                        "verbs": ["create", "delete"],
                     },
                 ],
             },
@@ -488,13 +483,13 @@ class HarborAWSStack(cdk.Stack):
                     "rules": [
                         {
                             "apiGroups": [""],
-                            "resources": ["pods", "pods/status", "pods/log"],
-                            "verbs": ["get", "list", "watch", "create", "delete"],
+                            "resources": ["pods"],
+                            "verbs": ["get", "list", "watch"],
                         },
                         {
                             "apiGroups": [""],
-                            "resources": ["configmaps", "secrets"],
-                            "verbs": ["get", "list", "create"],
+                            "resources": ["configmaps", "services"],
+                            "verbs": ["get"],
                         },
                     ],
                 },

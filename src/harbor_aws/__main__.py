@@ -176,22 +176,22 @@ def _destroy(args: argparse.Namespace) -> None:
 def _stop(args: argparse.Namespace) -> None:
     import asyncio
 
-    from harbor_aws.core.config import create_k8s_client, load_config_from_stack
-    from harbor_aws.core.pods import delete_pod, list_pods
+    asyncio.run(_async_stop(args))
 
-    config = asyncio.run(load_config_from_stack(
-        stack_name=args.stack_name,
-        region=args.region,
-    ))
-    api = create_k8s_client(config)
 
-    pod_names = asyncio.run(list_pods(api, config.namespace))
+async def _async_stop(args: argparse.Namespace) -> None:
+    import asyncio
+
+    from harbor_aws.core.config import create_k8s_client
+    from harbor_aws.core.pods import list_pods
+    from harbor_aws.runtime import runtime
+
+    cluster = await runtime.get_cluster_config(args.stack_name, args.region, None)
+    pod_names = await list_pods(create_k8s_client(cluster), cluster.namespace)
     if not pod_names:
         print("No running pods.")
         return
-
-    for name in pod_names:
-        asyncio.run(delete_pod(api, config.namespace, name))
+    await asyncio.gather(*(runtime.delete_pod(name) for name in pod_names))
     print(f"Deleted {len(pod_names)} pod(s). Infrastructure ready for next run.")
 
 

@@ -12,7 +12,6 @@ import socket
 import ssl
 
 import aiohttp
-from kubernetes import client
 
 from harbor_aws.core import pods
 from harbor_aws.core.config import ClusterConfig, create_k8s_client, load_config_from_stack
@@ -22,7 +21,6 @@ class AdapterRuntime:
 
     def __init__(self) -> None:
         self.cluster_config_task: asyncio.Task[ClusterConfig] | None = None
-        self.k8s_api: client.CoreV1Api | None = None
         self.session: aiohttp.ClientSession | None = None
         self.nlb_url: str | None = None
 
@@ -41,9 +39,9 @@ class AdapterRuntime:
         cluster = await load_config_from_stack(
             stack_name=stack_name, region=region, role_arn=role_arn,
         )
-        self.k8s_api = create_k8s_client(cluster)
-        await asyncio.to_thread(pods.validate_runner_configmap, self.k8s_api, cluster.namespace)
-        self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, self.k8s_api, cluster.namespace)
+        k8s_api = create_k8s_client(cluster)
+        await asyncio.to_thread(pods.validate_runner_configmap, k8s_api, cluster.namespace)
+        self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, k8s_api, cluster.namespace)
         self.session = self._build_session(cluster.nlb_cert_pem)
         return cluster
 
@@ -69,11 +67,6 @@ class AdapterRuntime:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=30),
         )
 
-    def get_k8s_client(self, cluster: ClusterConfig) -> client.CoreV1Api:
-        if self.k8s_api is None:
-            self.k8s_api = create_k8s_client(cluster)
-        return self.k8s_api
-
     def get_nlb_url(self) -> str:
         if self.nlb_url is None:
             raise RuntimeError("AdapterRuntime.get_nlb_url() called before bootstrap")
@@ -83,6 +76,24 @@ class AdapterRuntime:
         if self.session is None:
             raise RuntimeError("AdapterRuntime.get_session() called before bootstrap")
         return self.session
+
+    async def delete_pod(self, pod_name: str) -> None:
+        """Tell the control pod to delete a trial pod by name."""
+        cluster = await self._require_cluster_config()
+        headers = {"Authorization": f"Bearer {cluster.bearer_token}"}
+        async with self.get_session().post(
+            f"{self.get_nlb_url()}/delete-pod",
+            json={"pod_name": pod_name},
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"delete-pod {pod_name} failed ({resp.status}): {body}")
+
+    async def _require_cluster_config(self) -> ClusterConfig:
+        if self.cluster_config_task is None:
+            raise RuntimeError("AdapterRuntime: cluster config not bootstrapped")
+        return await self.cluster_config_task
 
 
 runtime = AdapterRuntime()

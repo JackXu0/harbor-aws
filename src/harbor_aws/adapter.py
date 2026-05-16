@@ -146,12 +146,11 @@ class AWSEnvironment(BaseEnvironment):
 
     async def stop(self, delete: bool) -> None:
         try:
+            if self.pod_name:
+                await runtime.delete_pod(self.pod_name)
             if self.remote_shell:
                 await self.remote_shell.close()
                 self.remote_shell = None
-            if self.pod_name and self.cluster_config is not None:
-                k8s_api = runtime.get_k8s_client(self.cluster_config)
-                await pods.delete_pod(k8s_api, self.cluster_config.namespace, self.pod_name)
         except Exception as e:
             self.logger.warning("Error deleting pod: %s", e)
         finally:

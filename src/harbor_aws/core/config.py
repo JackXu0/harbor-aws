@@ -124,9 +124,7 @@ def create_k8s_client(config: ClusterConfig) -> client.CoreV1Api:
             k8s_config.load_kube_config()
             _kubeconfig_setup_done = True
 
-    cfg = client.Configuration.get_default_copy()
-    cfg.connection_pool_maxsize = 500
-    return client.CoreV1Api(api_client=client.ApiClient(configuration=cfg))
+    return client.CoreV1Api(api_client=client.ApiClient())
 
 
 async def load_config_from_stack(

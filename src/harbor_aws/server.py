@@ -71,6 +71,7 @@ class ControlServer:
         app.router.add_post("/exec", self._handle_exec)
         app.router.add_post("/stop", self._handle_stop)
         app.router.add_post("/create-pod", self._handle_create_pod)
+        app.router.add_post("/delete-pod", self._handle_delete_pod)
         self.api_runner = web.AppRunner(app, access_log=None)
         await self.api_runner.setup()
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -227,7 +228,7 @@ class ControlServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
+        except ValueError:
             return web.json_response({"error": "invalid json"}, status=400)
         trial_id = body.get("trial_id")
         token = body.get("token")
@@ -262,7 +263,7 @@ class ControlServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
+        except ValueError:
             return web.json_response({"error": "invalid json"}, status=400)
         trial_id = body.get("trial_id")
         cmd = body.get("cmd")
@@ -297,7 +298,7 @@ class ControlServer:
                     assert t.writer is not None
                     t.writer.write(f"E\n{cmd_id}\n{timeout_sec}\n{b64_cmd}\n".encode())
                     await t.writer.drain()
-            except Exception as e:  # noqa: BLE001
+            except (ConnectionError, OSError) as e:
                 return web.json_response({"error": f"write failed: {e}"}, status=502)
             try:
                 stdout, stderr, rc = await asyncio.wait_for(fut, timeout=timeout_sec + 30)
@@ -316,7 +317,7 @@ class ControlServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
+        except ValueError:
             return web.json_response({"error": "invalid json"}, status=400)
         trial_id = body.get("trial_id")
         async with self.trials_lock:
@@ -340,7 +341,7 @@ class ControlServer:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
+        except ValueError:
             return web.json_response({"error": "invalid json"}, status=400)
 
         required = ("image_uri", "environment_name", "cpus", "memory_mb",
@@ -386,6 +387,21 @@ class ControlServer:
         )
         return web.json_response({"pod_name": pod_name})
 
+    async def _handle_delete_pod(self, request: web.Request) -> web.Response:
+        if not self._check_admin(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except ValueError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        pod_name = body.get("pod_name")
+        if not pod_name:
+            return web.json_response({"error": "missing pod_name"}, status=400)
+        try:
+            await pods.delete_pod(self.k8s_api, self.namespace, pod_name)
+        except k8s_client.ApiException as e:
+            return web.json_response({"error": f"K8s API error: {e.reason}"}, status=502)
+        return web.json_response({"ok": True})
 
 def _wrap_command(cmd: str, *, cwd: str | None, env: dict[str, str] | None) -> str:
     """Inline cwd and env into the command since the runner uses per-call subshells."""

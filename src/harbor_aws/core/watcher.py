@@ -93,17 +93,6 @@ class PodWatcher:
 
             return handle
 
-    @classmethod
-    def unregister(cls, pod_name: str) -> None:
-        """Unregister a pod from the singleton watcher. No-op if no watcher exists."""
-        inst = cls._instance
-        if inst is None:
-            return
-        with inst._handles_lock:
-            inst._handles.pop(pod_name, None)
-            inst._cached_statuses.pop(pod_name, None)
-
-
     def _watch_thread_main(self) -> None:
         try:
             api = self._make_core_v1_api()
