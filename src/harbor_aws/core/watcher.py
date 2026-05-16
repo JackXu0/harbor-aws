@@ -229,5 +229,5 @@ class PodWatcher:
 
     @staticmethod
     def _make_core_v1_api() -> client.CoreV1Api:
-        k8s_config.load_kube_config()
+        k8s_config.load_incluster_config()
         return client.CoreV1Api(api_client=client.ApiClient())

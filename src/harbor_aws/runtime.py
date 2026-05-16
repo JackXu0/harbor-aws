@@ -90,6 +90,33 @@ class AdapterRuntime:
                 body = await resp.text()
                 raise RuntimeError(f"delete-pod {pod_name} failed ({resp.status}): {body}")
 
+    async def list_pods(self) -> list[str]:
+        """Ask the control pod for all running trial pod names."""
+        cluster = await self._require_cluster_config()
+        headers = {"Authorization": f"Bearer {cluster.bearer_token}"}
+        async with self.get_session().get(
+            f"{self.get_nlb_url()}/list-pods",
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"list-pods failed ({resp.status}): {body}")
+            data = await resp.json()
+            return data["pod_names"]
+
+    async def wait_pod_running(self, pod_name: str) -> None:
+        """Block until the control pod observes the trial pod as Running."""
+        cluster = await self._require_cluster_config()
+        headers = {"Authorization": f"Bearer {cluster.bearer_token}"}
+        async with self.get_session().post(
+            f"{self.get_nlb_url()}/wait-pod-running",
+            json={"pod_name": pod_name},
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"wait-pod-running {pod_name} failed ({resp.status}): {body}")
+
     async def _require_cluster_config(self) -> ClusterConfig:
         if self.cluster_config_task is None:
             raise RuntimeError("AdapterRuntime: cluster config not bootstrapped")

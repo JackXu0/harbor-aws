@@ -260,7 +260,7 @@ class HarborAWSStack(cdk.Stack):
                     {
                         "apiGroups": [""],
                         "resources": ["pods"],
-                        "verbs": ["create", "delete"],
+                        "verbs": ["create", "delete", "get", "list", "watch"],
                     },
                 ],
             },
@@ -481,11 +481,6 @@ class HarborAWSStack(cdk.Stack):
                     "kind": "Role",
                     "metadata": {"name": "harbor-runner", "namespace": namespace},
                     "rules": [
-                        {
-                            "apiGroups": [""],
-                            "resources": ["pods"],
-                            "verbs": ["get", "list", "watch"],
-                        },
                         {
                             "apiGroups": [""],
                             "resources": ["configmaps", "services"],

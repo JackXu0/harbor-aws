@@ -11,7 +11,6 @@ from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
 from harbor_aws.core import images
-from harbor_aws.core.watcher import PodWatcher
 
 logger = logging.getLogger(__name__)
 
@@ -118,19 +117,12 @@ async def create_pod(
     return pod_name
 
 
-async def wait_for_pod_running(
-    namespace: str, pod_name: str, timeout_sec: int = 1800,
-) -> None:
-    logger.debug("Waiting for pod %s to be running...", pod_name)
-    watcher = await PodWatcher.get_or_create(namespace)
-    handle = watcher.register(pod_name)
-    try:
-        await asyncio.wait_for(handle.pod_running.wait(), timeout=timeout_sec)
-    except TimeoutError:
-        raise RuntimeError(f"Pod {pod_name} did not become Running in {timeout_sec}s") from None
-    if handle.error:
-        raise handle.error
-    logger.debug("Pod %s is running", pod_name)
+async def list_pods(api: client.CoreV1Api, namespace: str) -> list[str]:
+    """List all harbor-aws pods in the namespace."""
+    pods = await asyncio.to_thread(
+        api.list_namespaced_pod, namespace=namespace, label_selector="managed-by=harbor-aws",
+    )
+    return [p.metadata.name for p in pods.items]
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential_jitter(initial=1, max=10, jitter=2), reraise=True)
@@ -141,14 +133,6 @@ async def delete_pod(api: client.CoreV1Api, namespace: str, pod_name: str) -> No
     except client.ApiException as e:
         if e.status != 404:
             raise
-
-
-async def list_pods(api: client.CoreV1Api, namespace: str) -> list[str]:
-    """List all harbor-aws pods in the namespace."""
-    pods = await asyncio.to_thread(
-        api.list_namespaced_pod, namespace=namespace, label_selector="managed-by=harbor-aws",
-    )
-    return [p.metadata.name for p in pods.items]
 
 
 @retry(stop=stop_after_attempt(10), wait=wait_exponential_jitter(initial=2, max=10, jitter=2), reraise=True)

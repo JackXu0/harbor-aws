@@ -182,12 +182,10 @@ def _stop(args: argparse.Namespace) -> None:
 async def _async_stop(args: argparse.Namespace) -> None:
     import asyncio
 
-    from harbor_aws.core.config import create_k8s_client
-    from harbor_aws.core.pods import list_pods
     from harbor_aws.runtime import runtime
 
-    cluster = await runtime.get_cluster_config(args.stack_name, args.region, None)
-    pod_names = await list_pods(create_k8s_client(cluster), cluster.namespace)
+    await runtime.get_cluster_config(args.stack_name, args.region, None)
+    pod_names = await runtime.list_pods()
     if not pod_names:
         print("No running pods.")
         return

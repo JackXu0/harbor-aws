@@ -17,7 +17,7 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from harbor_aws.core import images, pods
+from harbor_aws.core import images
 from harbor_aws.core.config import ClusterConfig, TrialOptions
 from harbor_aws.core.remote_shell import RemoteShell
 from harbor_aws.runtime import runtime
@@ -116,7 +116,7 @@ class AWSEnvironment(BaseEnvironment):
                 service_account=service_account,
             )
 
-            await pods.wait_for_pod_running(self.cluster_config.namespace, self.pod_name)
+            await runtime.wait_pod_running(self.pod_name)
             try:
                 await asyncio.wait_for(register_task, timeout=RUNNER_AUTH_TIMEOUT_SEC)
             except TimeoutError:

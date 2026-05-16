@@ -20,6 +20,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from harbor_aws.core import pods
+from harbor_aws.core.watcher import PodWatcher
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ RUNNER_MAX_FRAME_BYTES = 6 * 1024 * 1024 * 1024  # 6 GiB
 
 POD_CREATE_SEMAPHORE_SIZE = 100
 POD_CREATE_TIMEOUT_SEC = 60.0
+WAIT_POD_RUNNING_TIMEOUT_SEC = 1800.0
 
 
 @dataclass
@@ -72,6 +74,8 @@ class ControlServer:
         app.router.add_post("/stop", self._handle_stop)
         app.router.add_post("/create-pod", self._handle_create_pod)
         app.router.add_post("/delete-pod", self._handle_delete_pod)
+        app.router.add_post("/wait-pod-running", self._handle_wait_pod_running)
+        app.router.add_get("/list-pods", self._handle_list_pods)
         self.api_runner = web.AppRunner(app, access_log=None)
         await self.api_runner.setup()
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -401,6 +405,42 @@ class ControlServer:
             await pods.delete_pod(self.k8s_api, self.namespace, pod_name)
         except k8s_client.ApiException as e:
             return web.json_response({"error": f"K8s API error: {e.reason}"}, status=502)
+        return web.json_response({"ok": True})
+
+    async def _handle_list_pods(self, request: web.Request) -> web.Response:
+        if not self._check_admin(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            pod_names = await pods.list_pods(self.k8s_api, self.namespace)
+        except k8s_client.ApiException as e:
+            return web.json_response({"error": f"K8s API error: {e.reason}"}, status=502)
+        return web.json_response({"pod_names": pod_names})
+
+    async def _handle_wait_pod_running(self, request: web.Request) -> web.Response:
+        if not self._check_admin(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except ValueError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        pod_name = body.get("pod_name")
+        if not pod_name:
+            return web.json_response({"error": "missing pod_name"}, status=400)
+
+        watcher = await PodWatcher.get_or_create(self.namespace)
+        handle = watcher.register(pod_name)
+        try:
+            await asyncio.wait_for(
+                handle.pod_running.wait(), timeout=WAIT_POD_RUNNING_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            return web.json_response(
+                {"error": f"pod {pod_name} did not become Running in "
+                          f"{WAIT_POD_RUNNING_TIMEOUT_SEC:.0f}s"},
+                status=504,
+            )
+        if handle.error is not None:
+            return web.json_response({"error": str(handle.error)}, status=502)
         return web.json_response({"ok": True})
 
 def _wrap_command(cmd: str, *, cwd: str | None, env: dict[str, str] | None) -> str:
