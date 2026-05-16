@@ -12,8 +12,12 @@ from dataclasses import dataclass
 import boto3
 from kubernetes import client
 from kubernetes import config as k8s_config
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
 logger = logging.getLogger(__name__)
+
+NLB_SERVICE = "harbor-control-nlb"
+API_PORT = 8443
 
 
 @dataclass(frozen=True)
@@ -174,6 +178,20 @@ async def load_config_from_stack(
 
     config.validate()
     return config
+
+
+@retry(stop=stop_after_attempt(10), wait=wait_exponential_jitter(initial=2, max=10, jitter=2), reraise=True)
+def discover_nlb_url(api: client.CoreV1Api, namespace: str) -> str:
+    """Read the NLB hostname from the harbor-control-nlb Service status."""
+    svc = api.read_namespaced_service(name=NLB_SERVICE, namespace=namespace)
+    lb_status = getattr(svc.status, "load_balancer", None) if svc.status else None
+    ingress = getattr(lb_status, "ingress", None) if lb_status else None
+    if not ingress or not ingress[0].hostname:
+        raise RuntimeError(
+            f"Service '{NLB_SERVICE}' in namespace '{namespace}' has no LB hostname yet "
+            f"(AWS Load Balancer Controller may still be provisioning)."
+        )
+    return f"https://{ingress[0].hostname}:{API_PORT}"
 
 
 def _required(outputs: dict[str, str], key: str, stack_name: str) -> str:

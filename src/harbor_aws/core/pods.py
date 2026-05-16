@@ -15,9 +15,6 @@ from harbor_aws.core import images
 logger = logging.getLogger(__name__)
 
 RUNNER_CONFIGMAP = "harbor-runner"
-NLB_SERVICE = "harbor-control-nlb"
-API_PORT = 8443
-
 EXECUTABLE_MODE = 0o755
 
 
@@ -133,32 +130,6 @@ async def delete_pod(api: client.CoreV1Api, namespace: str, pod_name: str) -> No
     except client.ApiException as e:
         if e.status != 404:
             raise
-
-
-@retry(stop=stop_after_attempt(10), wait=wait_exponential_jitter(initial=2, max=10, jitter=2), reraise=True)
-def discover_nlb_url(api: client.CoreV1Api, namespace: str) -> str:
-    """Read the NLB hostname from the harbor-control-nlb Service status."""
-    svc = api.read_namespaced_service(name=NLB_SERVICE, namespace=namespace)
-    lb_status = getattr(svc.status, "load_balancer", None) if svc.status else None
-    ingress = getattr(lb_status, "ingress", None) if lb_status else None
-    if not ingress or not ingress[0].hostname:
-        raise RuntimeError(
-            f"Service '{NLB_SERVICE}' in namespace '{namespace}' has no LB hostname yet "
-            f"(AWS Load Balancer Controller may still be provisioning)."
-        )
-    return f"https://{ingress[0].hostname}:{API_PORT}"
-
-
-def validate_runner_configmap(api: client.CoreV1Api, namespace: str) -> None:
-    try:
-        api.read_namespaced_config_map(name=RUNNER_CONFIGMAP, namespace=namespace)
-    except client.ApiException as e:
-        if e.status == 404:
-            raise RuntimeError(
-                f"ConfigMap '{RUNNER_CONFIGMAP}' not found in namespace '{namespace}'. "
-                f"Redeploy with: harbor-aws deploy"
-            ) from e
-        raise
 
 
 # --- helpers ---

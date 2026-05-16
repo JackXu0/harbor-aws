@@ -13,8 +13,12 @@ import ssl
 
 import aiohttp
 
-from harbor_aws.core import pods
-from harbor_aws.core.config import ClusterConfig, create_k8s_client, load_config_from_stack
+from harbor_aws.core.config import (
+    ClusterConfig,
+    create_k8s_client,
+    discover_nlb_url,
+    load_config_from_stack,
+)
 
 
 class AdapterRuntime:
@@ -40,8 +44,7 @@ class AdapterRuntime:
             stack_name=stack_name, region=region, role_arn=role_arn,
         )
         k8s_api = create_k8s_client(cluster)
-        await asyncio.to_thread(pods.validate_runner_configmap, k8s_api, cluster.namespace)
-        self.nlb_url = await asyncio.to_thread(pods.discover_nlb_url, k8s_api, cluster.namespace)
+        self.nlb_url = await asyncio.to_thread(discover_nlb_url, k8s_api, cluster.namespace)
         self.session = self._build_session(cluster.nlb_cert_pem)
         return cluster
 

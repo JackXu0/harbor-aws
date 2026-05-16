@@ -20,6 +20,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from harbor_aws.core import pods
+from harbor_aws.core.pods import RUNNER_CONFIGMAP
 from harbor_aws.core.watcher import PodWatcher
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,16 @@ class ControlServer:
         k8s_config.load_incluster_config()
         self.k8s_api = k8s_client.CoreV1Api()
         self.pod_create_semaphore = asyncio.Semaphore(POD_CREATE_SEMAPHORE_SIZE)
+
+        try:
+            self.k8s_api.read_namespaced_config_map(name=RUNNER_CONFIGMAP, namespace=self.namespace)
+        except k8s_client.ApiException as e:
+            if e.status == 404:
+                raise RuntimeError(
+                    f"ConfigMap '{RUNNER_CONFIGMAP}' not found in namespace '{self.namespace}'. "
+                    f"Redeploy with: harbor-aws deploy"
+                ) from e
+            raise
 
     async def start(self) -> None:
         app = web.Application(client_max_size=MAX_PAYLOAD_BYTES)
