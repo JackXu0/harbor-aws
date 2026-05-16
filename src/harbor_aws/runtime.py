@@ -80,6 +80,39 @@ class AdapterRuntime:
             raise RuntimeError("AdapterRuntime.get_session() called before bootstrap")
         return self.session
 
+    async def create_pod(
+        self,
+        *,
+        trial_id: str,
+        trial_token: str,
+        image_uri: str,
+        environment_name: str,
+        cpus: int,
+        memory_mb: int,
+        pod_timeout_sec: int,
+        service_account: str | None = None,
+    ) -> str:
+        """Ask the control pod to create a trial pod (rate-limited globally)."""
+        cluster = await self._require_cluster_config()
+        headers = {"Authorization": f"Bearer {cluster.bearer_token}"}
+        body = {
+            "trial_id": trial_id,
+            "trial_token": trial_token,
+            "image_uri": image_uri,
+            "environment_name": environment_name,
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "pod_timeout_sec": pod_timeout_sec,
+            "service_account": service_account,
+        }
+        async with self.get_session().post(
+            f"{self.get_nlb_url()}/create-pod", json=body, headers=headers,
+        ) as resp:
+            payload = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(f"create_pod failed ({resp.status}): {payload.get('error')}")
+            return payload["pod_name"]
+
     async def delete_pod(self, pod_name: str) -> None:
         """Tell the control pod to delete a trial pod by name."""
         cluster = await self._require_cluster_config()

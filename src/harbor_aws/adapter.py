@@ -107,7 +107,9 @@ class AWSEnvironment(BaseEnvironment):
         try:
             service_account = self.cluster_config.k8s_service_account if self.trial_options.use_bedrock else None
 
-            self.pod_name = await self.remote_shell.create_pod(
+            self.pod_name = await runtime.create_pod(
+                trial_id=self.session_id,
+                trial_token=trial_token,
                 image_uri=image_uri,
                 environment_name=self.environment_name,
                 cpus=pod_cpus,

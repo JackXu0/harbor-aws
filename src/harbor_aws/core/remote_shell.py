@@ -87,40 +87,6 @@ class RemoteShell:
         except Exception:
             logger.warning("RemoteShell.close() /stop failed for trial %s", self._trial_id, exc_info=True)
 
-    async def create_pod(
-        self,
-        image_uri: str,
-        environment_name: str,
-        cpus: int,
-        memory_mb: int,
-        pod_timeout_sec: int,
-        service_account: str | None = None,
-    ) -> str:
-        """Ask the control pod to create a trial pod (rate-limited globally).
-
-        Returns after the K8s API accepts the create
-        """
-        body = {
-            "trial_id": self._trial_id,
-            "trial_token": self._trial_token,
-            "image_uri": image_uri,
-            "environment_name": environment_name,
-            "cpus": cpus,
-            "memory_mb": memory_mb,
-            "pod_timeout_sec": pod_timeout_sec,
-            "service_account": service_account,
-        }
-        
-        async with self._session.post(
-            f"{self._nlb_url}/create-pod", json=body, headers=self._headers,
-        ) as resp:
-            payload = await resp.json()
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"create_pod failed ({resp.status}): {payload.get('error')}"
-                )
-            return payload["pod_name"]
-
     # --- command execution ---
 
     async def run(
