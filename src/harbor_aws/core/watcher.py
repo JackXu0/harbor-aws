@@ -73,7 +73,7 @@ class PodWatcher:
                     self._dispatch(cached_pod)
         await asyncio.wait_for(fut, timeout=timeout)
 
-    # ===== Watch-thread side: drive the K8s watch loop =====
+    # ===== Always-on background thread: K8s events watch loop =====
 
     def _watch_loop(self) -> None:
         try:
