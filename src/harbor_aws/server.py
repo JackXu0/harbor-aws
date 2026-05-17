@@ -264,11 +264,13 @@ class ControlServer:
             return web.json_response({"error": "missing trial_id"}, status=400)
         connect_timeout = float(body.get("connect_timeout", 600))
 
-        t = _TrialConn(trial_id=trial_id, trial_token=secrets.token_urlsafe(16))
         async with self.trials_lock:
-            if trial_id in self.trials:
-                return web.json_response({"error": "trial already registered"}, status=409)
-            self.trials[trial_id] = t
+            t = self.trials.get(trial_id)
+            if t is None:
+                t = _TrialConn(trial_id=trial_id, trial_token=secrets.token_urlsafe(16))
+                self.trials[trial_id] = t
+            elif t.runner_connected.is_set():
+                return web.json_response({"error": "trial already connected"}, status=409)
         logger.info("register: pre-registered trial %s, waiting for runner...", trial_id)
 
         try:
@@ -381,12 +383,11 @@ class ControlServer:
             )
 
         trial_id = body["trial_id"]
-        t = self.trials.get(trial_id)
-        if t is None:
-            return web.json_response(
-                {"error": f"trial {trial_id} not registered — call /register first"},
-                status=400,
-            )
+        async with self.trials_lock:
+            t = self.trials.get(trial_id)
+            if t is None:
+                t = _TrialConn(trial_id=trial_id, trial_token=secrets.token_urlsafe(16))
+                self.trials[trial_id] = t
 
         t_queued = time.monotonic()
         async with self.pod_create_semaphore:
