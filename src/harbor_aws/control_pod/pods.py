@@ -10,8 +10,6 @@ import uuid
 from kubernetes import client
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
-from harbor_aws.core import images
-
 logger = logging.getLogger(__name__)
 
 RUNNER_CONFIGMAP = "harbor-runner"
@@ -60,7 +58,6 @@ async def create_pod(
     """Create a Fargate pod that runs the harbor runner.sh as PID 1."""
     pod_name = _make_pod_name(trial_id)
     resources = {"cpu": str(cpus), "memory": f"{memory_mb}Mi", "ephemeral-storage": "50Gi"}
-    pull_secret = await images.ensure_docker_pull_secret(api, namespace)
 
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(
@@ -106,7 +103,6 @@ async def create_pod(
             active_deadline_seconds=pod_timeout_sec,
             service_account_name=service_account or None,
             restart_policy="Never",
-            image_pull_secrets=[client.V1LocalObjectReference(name=pull_secret)] if pull_secret else None,
         ),
     )
 

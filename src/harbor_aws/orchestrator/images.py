@@ -1,9 +1,8 @@
-"""
-Resolve and prepare container images for trial pods (build, ECR cache, Docker Hub auth, resource profiles).
+"""Image resolution (3 tiers) and tier-3 docker build + ECR push (orchestrator-side).
 
-  Tier 1 — If docker image pre built, pull from docker hub or ECR.
-  Tier 2 — If docker image not exist, but Dockerfile is simple. Pull base image, and replay RUN/WORKDIR/ENV once the pod is up.
-  Tier 3 — If docker image not exist, and Dockerfile complex, build and cache in ECR.
+  Tier 1 — If docker image pre-built, pull from Docker Hub or ECR.
+  Tier 2 — Simple Dockerfile, pull base image, replay RUN/WORKDIR/ENV in-pod.
+  Tier 3 — Complex Dockerfile, build locally and cache in ECR.
 """
 
 from __future__ import annotations
@@ -19,21 +18,16 @@ from pathlib import Path
 
 import boto3
 from harbor.models.task.config import EnvironmentConfig
-from kubernetes import client
 
-from harbor_aws.core.config import ClusterInfo
+from harbor_aws.models import ClusterInfo
 
 _ECR_REPO = "harbor-build"
 _ECR_SEMAPHORE_LIMIT = 50
 
-# Module-level shared state (one set per process).
-_docker_secret_checked = False
-_docker_secret_name: str | None = None
 _build_locks: dict[str, asyncio.Lock] = {}
 _shared_ecr_client = None  # boto3 ECR client (lazy)
 _ecr_semaphore: asyncio.Semaphore | None = None
 _shared_boto3_session: boto3.Session | None = None
-_session_lock = asyncio.Lock()
 
 
 def _get_ecr_semaphore() -> asyncio.Semaphore:
@@ -44,7 +38,6 @@ def _get_ecr_semaphore() -> asyncio.Semaphore:
 
 
 def _boto3_session(region: str, role_arn: str | None) -> boto3.Session:
-    """One process-wide boto3 session. Assumes role_arn if provided."""
     global _shared_boto3_session
     if _shared_boto3_session is not None:
         return _shared_boto3_session
@@ -65,59 +58,13 @@ def _boto3_session(region: str, role_arn: str | None) -> boto3.Session:
 
 
 def _get_ecr_client(region: str, role_arn: str | None):  # noqa: ANN202 — boto3 client type
-    """One process-wide boto3 ECR client. Avoids ~1s session+client setup per call."""
     global _shared_ecr_client
     if _shared_ecr_client is None:
         _shared_ecr_client = _boto3_session(region, role_arn).client("ecr", region_name=region)
     return _shared_ecr_client
 
 
-# -- Docker Hub credentials ----------------------------------------------------
-
-
-async def ensure_docker_pull_secret(
-    k8s_api: client.CoreV1Api,
-    namespace: str,
-) -> str | None:
-    """Create imagePullSecret from ~/.docker/config.json if not already present.
-
-    Returns the secret name (or ``None`` if no Docker Hub creds were found).
-    Idempotent across the process — only the first call hits the K8s API.
-    """
-    global _docker_secret_checked, _docker_secret_name
-    if _docker_secret_checked:
-        return _docker_secret_name
-    _docker_secret_checked = True
-
-    docker_cfg = Path.home() / ".docker" / "config.json"
-    if not docker_cfg.exists():
-        return None
-    try:
-        auths = json.loads(docker_cfg.read_text()).get("auths", {})
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not any("docker.io" in k for k in auths):
-        return None
-
-    secret_name = "dockerhub-creds"
-    secret = client.V1Secret(
-        metadata=client.V1ObjectMeta(name=secret_name),
-        type="kubernetes.io/dockerconfigjson",
-        data={".dockerconfigjson": base64.b64encode(docker_cfg.read_bytes()).decode()},
-    )
-    try:
-        await asyncio.to_thread(
-            k8s_api.create_namespaced_secret,
-            namespace=namespace, body=secret,
-        )
-    except client.ApiException as e:
-        if e.status != 409:
-            raise
-    _docker_secret_name = secret_name
-    return secret_name
-
-
-# -- ECR pull-through cache rewrite --------------------------------------------
+# ===== ECR pull-through cache rewrite =====
 
 
 def _ecr_image_uri(image: str, region: str, info: ClusterInfo, logger: logging.Logger) -> str:
@@ -125,12 +72,11 @@ def _ecr_image_uri(image: str, region: str, info: ClusterInfo, logger: logging.L
 
     ``alexgshaw/foo:tag`` → ``<account>.dkr.ecr.<region>.amazonaws.com/docker-hub/alexgshaw/foo:tag``
 
-    Non-Docker-Hub images are returned unchanged.
+    Non-Docker-Hub images returned unchanged.
     """
     stripped = re.sub(r"^(docker\.io|registry-1\.docker\.io)/", "", image)
 
-    # Any `host.tld/...` prefix means the image already has an explicit
-    # registry — don't rewrite it. (This covers ECR, GHCR, etc. as well.)
+    # Any host.tld/... prefix means image already has an explicit registry — don't rewrite.
     if re.match(r"^[\w.-]+\.\w{2,}/", stripped):
         return image
 
@@ -144,7 +90,7 @@ def _ecr_image_uri(image: str, region: str, info: ClusterInfo, logger: logging.L
     return f"{info.account_id}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
 
 
-# -- Image resolution (three tiers) --------------------------------------------
+# ===== Image resolution (three tiers) =====
 
 
 async def resolve_image(
@@ -196,13 +142,12 @@ async def _resolve_image_uri(
 
 
 def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | None:
-    """Return ``(base_image, setup_commands)`` if the Dockerfile can be
-    replayed inside a running pod, or ``None`` if it needs ``docker build``.
+    """Return ``(base_image, setup_commands)`` if the Dockerfile can be replayed
+    inside a running pod, or ``None`` if it needs ``docker build``.
 
-    Replay-compatible means: a single ``FROM`` plus only ``RUN`` /
-    ``WORKDIR`` / ``ENV`` / ``LABEL`` / ``MAINTAINER`` instructions.
-    Anything else (``COPY``, ``ADD``, multi-stage, BuildKit ``RUN --flag``,
-    ``ENTRYPOINT``, ``CMD``, ``USER``, ...) bails out to tier 3.
+    Replay-compatible: single ``FROM`` + only ``RUN`` / ``WORKDIR`` / ``ENV`` /
+    ``LABEL`` / ``MAINTAINER``. Anything else (``COPY``, ``ADD``, multi-stage,
+    BuildKit ``RUN --flag``, ``ENTRYPOINT``, ``CMD``, ``USER``, ...) → tier 3.
     """
     image: str | None = None
     commands: list[str] = []
@@ -216,7 +161,7 @@ def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | N
         if instr == "FROM":
             from_count += 1
             if from_count > 1:
-                return None  # multi-stage
+                return None
             image = rest.split()[0]
         elif instr == "RUN":
             if rest.startswith("--"):
@@ -225,7 +170,6 @@ def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | N
         elif instr == "WORKDIR":
             commands.append(f"mkdir -p {rest} && cd {rest}")
         elif instr == "ENV":
-            # `ENV K=V` and `ENV K V` both supported
             if "=" in rest.split(maxsplit=1)[0]:
                 commands.append(f"export {rest}")
             else:
@@ -233,7 +177,7 @@ def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | N
                 if len(parts) == 2:
                     commands.append(f"export {parts[0]}={parts[1]}")
         elif instr in {"LABEL", "MAINTAINER"}:
-            continue  # no runtime effect
+            continue
         else:
             return None  # COPY, ADD, ENTRYPOINT, CMD, USER, ARG, VOLUME, ...
 
@@ -241,7 +185,7 @@ def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | N
 
 
 def _dockerfile_logical_lines(environment_dir: Path) -> list[str]:
-    """Read the Dockerfile and yield logical lines (joining ``\\``-continuations)."""
+    """Read the Dockerfile and yield logical lines (joining ``\\`` continuations)."""
     raw_lines = (environment_dir / "Dockerfile").read_text().splitlines()
     logical: list[str] = []
     current = ""
@@ -266,23 +210,19 @@ async def _build_image_via_docker(
     info: ClusterInfo,
     logger: logging.Logger,
 ) -> str:
-    """Build the environment Dockerfile locally and push it to ECR.
+    """Build the environment Dockerfile locally and push to ECR.
 
-    Used only as a last resort when the Dockerfile has instructions that
-    can't be replayed inside the pod after start (COPY, ADD, multi-stage,
-    ENTRYPOINT, etc.).
+    Last resort when the Dockerfile has instructions that can't be replayed in
+    the pod after start (COPY, ADD, multi-stage, ENTRYPOINT, etc.).
     """
     dockerfile = environment_dir / "Dockerfile"
     tag = hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:16]
     ecr_uri = f"{info.account_id}.dkr.ecr.{region}.amazonaws.com/{_ECR_REPO}:{tag}"
 
-    # Per-tag lock to avoid duplicate builds when many trials share a Dockerfile
     if tag not in _build_locks:
         _build_locks[tag] = asyncio.Lock()
 
     async with _build_locks[tag]:
-        # Cache check stays outside the semaphore — gating it would serialize
-        # every cache hit, which is the common path at scale.
         if await asyncio.to_thread(_ecr_image_exists, tag, region, role_arn):
             logger.debug("Using cached build %s", ecr_uri)
             return ecr_uri
@@ -316,7 +256,6 @@ def _docker_build_and_push(ecr_uri: str, environment_dir: Path, region: str, rol
                            "countUnit": "days", "countNumber": 90}}]},
         ))
 
-    # Login to ECR
     auth = ecr.get_authorization_token()["authorizationData"][0]
     token = base64.b64decode(auth["authorizationToken"]).decode()
     username, password = token.split(":", 1)
@@ -325,6 +264,5 @@ def _docker_build_and_push(ecr_uri: str, environment_dir: Path, region: str, rol
         input=password, capture_output=True, text=True, check=True,
     )
 
-    # Build and push
     subprocess.run(["docker", "build", "-t", ecr_uri, str(environment_dir)], check=True, capture_output=True, text=True)
     subprocess.run(["docker", "push", ecr_uri], check=True, capture_output=True, text=True)

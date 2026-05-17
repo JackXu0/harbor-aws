@@ -16,10 +16,10 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from harbor_aws.control_pod_client import control_pod
-from harbor_aws.core import images
-from harbor_aws.core.config import TrialOptions
-from harbor_aws.core.trial_session import TrialSession
+from harbor_aws.models import TrialOptions
+from harbor_aws.orchestrator import images
+from harbor_aws.orchestrator.client import control_pod
+from harbor_aws.orchestrator.trial_session import TrialSession
 
 RUNNER_AUTH_TIMEOUT_SEC = 60.0
 

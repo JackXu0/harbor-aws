@@ -195,7 +195,7 @@ def _stop(args: argparse.Namespace) -> None:
 
 
 async def _async_stop(_args: argparse.Namespace) -> None:
-    from harbor_aws.control_pod_client import control_pod
+    from harbor_aws.orchestrator.client import control_pod
 
     pod_names = await control_pod.list_pods()
     if not pod_names:

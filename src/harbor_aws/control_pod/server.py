@@ -19,9 +19,9 @@ from aiohttp import web
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
-from harbor_aws.core import pods
-from harbor_aws.core.pods import RUNNER_CONFIGMAP
-from harbor_aws.core.pods_status_watcher import PodStatusWatcher
+from harbor_aws.control_pod import pods
+from harbor_aws.control_pod.pods import RUNNER_CONFIGMAP
+from harbor_aws.control_pod.status_watcher import PodStatusWatcher
 
 logger = logging.getLogger(__name__)
 

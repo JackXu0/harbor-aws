@@ -11,7 +11,7 @@ from shlex import quote as _q
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from harbor_aws.control_pod_client import ControlPodClient
+    from harbor_aws.orchestrator.client import ControlPodClient
 
 logger = logging.getLogger(__name__)
 

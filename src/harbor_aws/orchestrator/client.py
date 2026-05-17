@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from harbor_aws.core.config import ClusterInfo
+from harbor_aws.models import ClusterInfo
 
 
 class ControlPodClient:
