@@ -94,7 +94,6 @@ class ControlPodClient:
         self,
         *,
         trial_id: str,
-        trial_token: str,
         image_uri: str,
         environment_name: str,
         cpus: int,
@@ -106,7 +105,6 @@ class ControlPodClient:
         await self._ensure_bootstrapped()
         body = {
             "trial_id": trial_id,
-            "trial_token": trial_token,
             "image_uri": image_uri,
             "environment_name": environment_name,
             "cpus": cpus,
@@ -157,14 +155,11 @@ class ControlPodClient:
 
     # ===== Per-trial HTTPS methods (called by TrialSession, keyed by trial_id) =====
 
-    async def register_trial(
-        self, trial_id: str, trial_token: str, *, connect_timeout: float = 1800.0,
-    ) -> None:
-        """Pre-register a trial; blocks until the runner dials in."""
+    async def register_trial(self, trial_id: str, *, connect_timeout: float = 1800.0) -> None:
         await self._ensure_bootstrapped()
         async with self.session.post(
             f"{self.nlb_url}/register",
-            json={"trial_id": trial_id, "token": trial_token, "connect_timeout": connect_timeout},
+            json={"trial_id": trial_id, "connect_timeout": connect_timeout},
             headers=self._auth_headers(),
             timeout=aiohttp.ClientTimeout(total=connect_timeout + 30),
         ) as resp:

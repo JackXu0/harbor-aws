@@ -1,8 +1,4 @@
-"""Per-trial handle over the runtime's HTTPS client.
-
-Bundles ``trial_id`` + ``trial_token`` so callers don't pass them on every
-``run`` / ``upload`` / ``download``. All HTTPS work delegates to the control pod client.
-"""
+"""Per-trial handle over the control pod client."""
 
 from __future__ import annotations
 
@@ -22,9 +18,8 @@ logger = logging.getLogger(__name__)
 
 class TrialSession:
 
-    def __init__(self, trial_id: str, trial_token: str, control_pod: ControlPodClient) -> None:
+    def __init__(self, trial_id: str, control_pod: ControlPodClient) -> None:
         self._trial_id = trial_id
-        self._trial_token = trial_token
         self._control_pod = control_pod
         self._closed = False
 
@@ -33,7 +28,7 @@ class TrialSession:
     async def connect(self, connect_timeout: float = 1800.0) -> None:
         """Pre-register the trial; blocks until the runner dials in."""
         await self._control_pod.register_trial(
-            self._trial_id, self._trial_token, connect_timeout=connect_timeout,
+            self._trial_id, connect_timeout=connect_timeout,
         )
 
     async def close(self) -> None:

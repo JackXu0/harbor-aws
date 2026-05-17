@@ -260,12 +260,11 @@ class ControlServer:
         except ValueError:
             return web.json_response({"error": "invalid json"}, status=400)
         trial_id = body.get("trial_id")
-        token = body.get("token")
-        if not trial_id or not token:
-            return web.json_response({"error": "missing trial_id or token"}, status=400)
+        if not trial_id:
+            return web.json_response({"error": "missing trial_id"}, status=400)
         connect_timeout = float(body.get("connect_timeout", 600))
 
-        t = _TrialConn(trial_id=trial_id, trial_token=token)
+        t = _TrialConn(trial_id=trial_id, trial_token=secrets.token_urlsafe(16))
         async with self.trials_lock:
             if trial_id in self.trials:
                 return web.json_response({"error": "trial already registered"}, status=409)
@@ -374,11 +373,19 @@ class ControlServer:
             return web.json_response({"error": "invalid json"}, status=400)
 
         required = ("image_uri", "environment_name", "cpus", "memory_mb",
-                    "trial_id", "trial_token", "pod_timeout_sec")
+                    "trial_id", "pod_timeout_sec")
         missing = [k for k in required if body.get(k) is None]
         if missing:
             return web.json_response(
                 {"error": f"missing fields: {missing}"}, status=400,
+            )
+
+        trial_id = body["trial_id"]
+        t = self.trials.get(trial_id)
+        if t is None:
+            return web.json_response(
+                {"error": f"trial {trial_id} not registered — call /register first"},
+                status=400,
             )
 
         t_queued = time.monotonic()
@@ -393,8 +400,8 @@ class ControlServer:
                         environment_name=body["environment_name"],
                         cpus=int(body["cpus"]),
                         memory_mb=int(body["memory_mb"]),
-                        trial_id=body["trial_id"],
-                        trial_token=body["trial_token"],
+                        trial_id=trial_id,
+                        trial_token=t.trial_token,
                         pod_timeout_sec=int(body["pod_timeout_sec"]),
                         service_account=body.get("service_account"),
                     ),

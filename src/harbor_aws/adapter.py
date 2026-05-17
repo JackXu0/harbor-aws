@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import secrets
 from pathlib import Path
 
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -87,12 +86,8 @@ class AWSEnvironment(BaseEnvironment):
         pod_cpus = self.cpus_override or self.task_env_config.cpus
         pod_memory = self.memory_mb_override or self.task_env_config.memory_mb
 
-        # Per-trial token used by the trial pod to authenticate to the control pod.
-        trial_token = secrets.token_urlsafe(16)
-
         self.trial_session = TrialSession(
             trial_id=self.session_id,
-            trial_token=trial_token,
             control_pod=control_pod,
         )
 
@@ -103,7 +98,6 @@ class AWSEnvironment(BaseEnvironment):
 
             self.pod_name = await control_pod.create_pod(
                 trial_id=self.session_id,
-                trial_token=trial_token,
                 image_uri=image_uri,
                 environment_name=self.environment_name,
                 cpus=pod_cpus,
