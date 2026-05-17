@@ -14,7 +14,7 @@ The main bottleneck of running Harbor benchmarks on AWS EKS Fargate is using Kub
 
 ## Solution
 
-Harbor-aws exposes an in-cluster Harbor control service through a Network Load Balancer. The control service maintains long-lived connections with the trial pods. Benchmark commands are sent to the control service and then forwarded to the target pod without going through the AWS-managed Kubernetes control plane.
+Harbor-aws exposes an in-cluster Harbor control service through a Network Load Balancer. The control service holds long-lived TCP connections from the trial pods (each runner dials out to the control pod). Benchmark commands are sent to the control service and then forwarded to the target pod over those connections — bypassing the AWS-managed Kubernetes control plane entirely.
 
 ## Install
 
@@ -44,7 +44,15 @@ aws secretsmanager create-secret \
   --secret-string '{"username":"<user>","accessToken":"<token>"}'
 ```
 
-### 3. Run benchmarks
+### 3. Set HARBOR_* env vars
+
+```bash
+eval $(harbor-aws env --stack-name harbor-aws --region us-east-1)
+```
+
+Sets `HARBOR_NLB_URL`, `HARBOR_BEARER_TOKEN`, `HARBOR_NLB_CERT` so the adapter can find and authenticate to the control pod.
+
+### 4. Run benchmarks
 
 ```bash
 # Example: terminal-bench with terminus-2 + Sonnet 4.6 via Bedrock, 89 concurrent trials.
@@ -56,7 +64,7 @@ harbor jobs start \
   -n 89
 ```
 
-### 4. Clean up
+### 5. Clean up
 
 ```bash
 harbor-aws stop              # delete trial pods, keep cluster

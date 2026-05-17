@@ -17,10 +17,10 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
+from harbor_aws.control_pod_client import control_pod
 from harbor_aws.core import images
-from harbor_aws.core.config import ClusterConfig, TrialOptions
-from harbor_aws.core.remote_shell import RemoteShell
-from harbor_aws.runtime import runtime
+from harbor_aws.core.config import TrialOptions
+from harbor_aws.core.trial_session import TrialSession
 
 RUNNER_AUTH_TIMEOUT_SEC = 60.0
 
@@ -37,7 +37,6 @@ class AWSEnvironment(BaseEnvironment):
         *,
         region: str = "us-east-1",
         role_arn: str | None = None,
-        stack_name: str = "harbor-aws",
         bedrock: bool = False,
         cpus: int | None = None,
         memory_mb: int | None = None,
@@ -55,10 +54,9 @@ class AWSEnvironment(BaseEnvironment):
             **kwargs,
         )
 
-        # Stack lookup parameters — only used until ClusterConfig is loaded.
+        # AWS credentials for ECR push (tier-3 image builds).
         self.region = region
         self.role_arn = role_arn
-        self.stack_name = stack_name
 
         self.trial_options = TrialOptions(
             pod_timeout_sec=int(pod_timeout_sec),
@@ -68,24 +66,22 @@ class AWSEnvironment(BaseEnvironment):
         self.cpus_override = int(cpus) if cpus is not None else None
         self.memory_mb_override = int(memory_mb) if memory_mb is not None else None
 
-        # Populated by start() once runtime.get_cluster_config() resolves.
-        self.cluster_config: ClusterConfig | None = None
-
         self.pod_name: str | None = None
-        self.remote_shell: RemoteShell | None = None
+        self.trial_session: TrialSession | None = None
 
     # -- Lifecycle ---------------------------------------------------------
 
     async def start(self, force_build: bool) -> None:
         """Start a Kubernetes pod for the benchmark task."""
-        if self.remote_shell is not None or self.pod_name is not None:
+        if self.trial_session is not None or self.pod_name is not None:
             self.logger.warning("start() retried for session %s; cleaning up previous attempt", self.session_id)
             await self.stop(delete=True)
 
-        self.cluster_config = await runtime.get_cluster_config(self.stack_name, self.region, self.role_arn)
+        info = await control_pod.get_info()
 
         image_uri, dockerfile_commands = await images.resolve_image(
-            self.environment_dir, self.task_env_config, self.cluster_config, self.logger,
+            self.environment_dir, self.task_env_config,
+            self.region, self.role_arn, info, self.logger,
         )
 
         pod_cpus = self.cpus_override or self.task_env_config.cpus
@@ -94,20 +90,18 @@ class AWSEnvironment(BaseEnvironment):
         # Per-trial token used by the trial pod to authenticate to the control pod.
         trial_token = secrets.token_urlsafe(16)
 
-        self.remote_shell = RemoteShell(
+        self.trial_session = TrialSession(
             trial_id=self.session_id,
             trial_token=trial_token,
-            nlb_url=runtime.get_nlb_url(),
-            bearer_token=self.cluster_config.bearer_token,
-            session=runtime.get_session(),
+            control_pod=control_pod,
         )
 
-        register_task = asyncio.create_task(self.remote_shell.connect())
+        register_task = asyncio.create_task(self.trial_session.connect())
 
         try:
-            service_account = self.cluster_config.k8s_service_account if self.trial_options.use_bedrock else None
+            service_account = info.k8s_service_account if self.trial_options.use_bedrock else None
 
-            self.pod_name = await runtime.create_pod(
+            self.pod_name = await control_pod.create_pod(
                 trial_id=self.session_id,
                 trial_token=trial_token,
                 image_uri=image_uri,
@@ -118,7 +112,7 @@ class AWSEnvironment(BaseEnvironment):
                 service_account=service_account,
             )
 
-            await runtime.wait_pod_running(self.pod_name)
+            await control_pod.wait_pod_running(self.pod_name)
             try:
                 await asyncio.wait_for(register_task, timeout=RUNNER_AUTH_TIMEOUT_SEC)
             except TimeoutError:
@@ -149,10 +143,10 @@ class AWSEnvironment(BaseEnvironment):
     async def stop(self, delete: bool) -> None:
         try:
             if self.pod_name:
-                await runtime.delete_pod(self.pod_name)
-            if self.remote_shell:
-                await self.remote_shell.close()
-                self.remote_shell = None
+                await control_pod.delete_pod(self.pod_name)
+            if self.trial_session:
+                await self.trial_session.close()
+                self.trial_session = None
         except Exception as e:
             self.logger.warning("Error deleting pod: %s", e)
         finally:
@@ -166,42 +160,42 @@ class AWSEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        if self.remote_shell is None:
+        if self.trial_session is None:
             raise RuntimeError("Pod not running. Call start() first.")
-            
+
         if user is not None and user not in ("root", 0, "0"):
             raise NotImplementedError(f"AWSEnvironment.exec(user={user!r}) is not supported")
-        stdout, stderr, return_code = await self.remote_shell.run(
+        stdout, stderr, return_code = await self.trial_session.run(
             command, cwd=cwd, env=env, timeout_sec=timeout_sec or 900,
         )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        if self.remote_shell is None:
+        if self.trial_session is None:
             raise RuntimeError("Pod not running. Call start() first.")
-        await self.remote_shell.upload_file(source_path, target_path)
+        await self.trial_session.upload_file(source_path, target_path)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        if self.remote_shell is None:
+        if self.trial_session is None:
             raise RuntimeError("Pod not running. Call start() first.")
-        await self.remote_shell.upload_dir(source_dir, target_dir)
+        await self.trial_session.upload_dir(source_dir, target_dir)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        if self.remote_shell is None:
+        if self.trial_session is None:
             raise RuntimeError("Pod not running. Call start() first.")
-        await self.remote_shell.download_file(source_path, target_path)
+        await self.trial_session.download_file(source_path, target_path)
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        if self.remote_shell is None:
+        if self.trial_session is None:
             raise RuntimeError("Pod not running. Call start() first.")
-        await self.remote_shell.download_dir(source_dir, target_dir)
+        await self.trial_session.download_dir(source_dir, target_dir)
 
     async def attach(self) -> None:
-        if not self.pod_name or not self.cluster_config:
+        if not self.pod_name or control_pod.info is None:
             raise RuntimeError("attach: pod not running")
         os.execvp("kubectl", [
             "kubectl", "exec", "-it",
-            "-n", self.cluster_config.namespace,
+            "-n", control_pod.info.namespace,
             self.pod_name, "--", "/bin/bash",
         ])
 

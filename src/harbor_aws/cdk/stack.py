@@ -352,6 +352,10 @@ class HarborAWSStack(cdk.Stack):
                                     {"name": "HARBOR_TLS_CERT_FILE", "value": "/tls/tls.crt"},
                                     {"name": "HARBOR_TLS_KEY_FILE", "value": "/tls/tls.key"},
                                     {"name": "HARBOR_NAMESPACE", "value": namespace},
+                                    {"name": "HARBOR_K8S_SERVICE_ACCOUNT", "value": pod_sa.service_account_name},
+                                    {"name": "HARBOR_ACCOUNT_ID", "value": cdk.Aws.ACCOUNT_ID},
+                                    {"name": "HARBOR_DOCKERHUB_CACHE_ENABLED",
+                                     "value": str(docker_hub_secret_arn is not None).lower()},
                                 ],
                                 "volumeMounts": [
                                     {"name": "tls", "mountPath": "/tls", "readOnly": True},
@@ -533,7 +537,7 @@ def _generate_self_signed_cert() -> tuple[str, str]:
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "harbor-aws-control"),
     ])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)

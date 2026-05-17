@@ -27,7 +27,7 @@ _PERMANENT_WAITING_REASONS = frozenset({
 })
 
 
-class PodWatcher:
+class PodStatusWatcher:
     """Watches all harbor-aws pods via a single K8s watch stream."""
 
     def __init__(self, namespace: str) -> None:
@@ -45,7 +45,7 @@ class PodWatcher:
     # ===== Public API =====
 
     @classmethod
-    async def create(cls, namespace: str) -> PodWatcher:
+    async def create(cls, namespace: str) -> PodStatusWatcher:
         watcher = cls(namespace)
         watcher._loop = asyncio.get_running_loop()
         watcher._watch_thread = threading.Thread(
@@ -55,7 +55,7 @@ class PodWatcher:
         ready = await asyncio.to_thread(watcher._started.wait, _STARTUP_TIMEOUT)
         if not ready:
             raise TimeoutError(
-                f"PodWatcher startup exceeded {_STARTUP_TIMEOUT:.0f}s (initial K8s list slow or hung)"
+                f"PodStatusWatcher startup exceeded {_STARTUP_TIMEOUT:.0f}s (initial K8s list slow or hung)"
             )
         if watcher._thread_error is not None:
             raise watcher._thread_error
@@ -79,13 +79,13 @@ class PodWatcher:
         try:
             self._reconcile(self._k8s_api())
         except Exception as exc:
-            logger.exception("PodWatcher initial list failed")
+            logger.exception("PodStatusWatcher initial list failed")
             self._thread_error = exc
             self._started.set()
             return
 
         self._started.set()
-        logger.info("PodWatcher started (namespace=%s)", self._namespace)
+        logger.info("PodStatusWatcher started (namespace=%s)", self._namespace)
 
         while True:
             try:
@@ -109,10 +109,10 @@ class PodWatcher:
                                 self._unclaimed.pop(pod_name, None)
                             else:
                                 self._dispatch(pod)
-                                
+
                         self._resource_version = pod.metadata.resource_version
                     except Exception:
-                        logger.exception("PodWatcher: skipping bad event")
+                        logger.exception("PodStatusWatcher: skipping bad event")
                 self._backoff = _BACKOFF_INITIAL
             except client.ApiException as e:
                 if e.status == 410:
@@ -140,7 +140,7 @@ class PodWatcher:
         with self._handles_lock:
             for pod in pod_list.items:
                 self._dispatch(pod)
-        logger.debug("PodWatcher reconciled: %d pods, rv=%s", len(pod_list.items), self._resource_version)
+        logger.debug("PodStatusWatcher reconciled: %d pods, rv=%s", len(pod_list.items), self._resource_version)
 
     def _dispatch(self, pod: client.V1Pod) -> None:
         """Route to handle or stash as unclaimed. Caller holds _handles_lock."""

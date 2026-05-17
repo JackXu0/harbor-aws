@@ -17,10 +17,11 @@ import re
 import subprocess
 from pathlib import Path
 
+import boto3
 from harbor.models.task.config import EnvironmentConfig
 from kubernetes import client
 
-from harbor_aws.core.config import ClusterConfig
+from harbor_aws.core.config import ClusterInfo
 
 _ECR_REPO = "harbor-build"
 _ECR_SEMAPHORE_LIMIT = 50
@@ -31,6 +32,9 @@ _docker_secret_name: str | None = None
 _build_locks: dict[str, asyncio.Lock] = {}
 _shared_ecr_client = None  # boto3 ECR client (lazy)
 _ecr_semaphore: asyncio.Semaphore | None = None
+_shared_boto3_session: boto3.Session | None = None
+_session_lock = asyncio.Lock()
+
 
 def _get_ecr_semaphore() -> asyncio.Semaphore:
     global _ecr_semaphore
@@ -39,12 +43,32 @@ def _get_ecr_semaphore() -> asyncio.Semaphore:
     return _ecr_semaphore
 
 
-def _get_ecr_client(cluster: ClusterConfig):  # noqa: ANN202 — boto3 client type
+def _boto3_session(region: str, role_arn: str | None) -> boto3.Session:
+    """One process-wide boto3 session. Assumes role_arn if provided."""
+    global _shared_boto3_session
+    if _shared_boto3_session is not None:
+        return _shared_boto3_session
+
+    if not role_arn:
+        _shared_boto3_session = boto3.Session(region_name=region)
+        return _shared_boto3_session
+
+    sts = boto3.client("sts", region_name=region)
+    creds = sts.assume_role(RoleArn=role_arn, RoleSessionName="harbor-aws")["Credentials"]
+    _shared_boto3_session = boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=region,
+    )
+    return _shared_boto3_session
+
+
+def _get_ecr_client(region: str, role_arn: str | None):  # noqa: ANN202 — boto3 client type
     """One process-wide boto3 ECR client. Avoids ~1s session+client setup per call."""
     global _shared_ecr_client
     if _shared_ecr_client is None:
-        session = cluster.create_boto3_session()
-        _shared_ecr_client = session.client("ecr", region_name=cluster.region)
+        _shared_ecr_client = _boto3_session(region, role_arn).client("ecr", region_name=region)
     return _shared_ecr_client
 
 
@@ -96,7 +120,7 @@ async def ensure_docker_pull_secret(
 # -- ECR pull-through cache rewrite --------------------------------------------
 
 
-def _ecr_image_uri(image: str, cluster: ClusterConfig, logger: logging.Logger) -> str:
+def _ecr_image_uri(image: str, region: str, info: ClusterInfo, logger: logging.Logger) -> str:
     """Rewrite a Docker Hub image to use the ECR pull-through cache.
 
     ``alexgshaw/foo:tag`` → ``<account>.dkr.ecr.<region>.amazonaws.com/docker-hub/alexgshaw/foo:tag``
@@ -113,14 +137,11 @@ def _ecr_image_uri(image: str, cluster: ClusterConfig, logger: logging.Logger) -
     if "/" not in stripped.split(":")[0]:
         stripped = f"library/{stripped}"
 
-    account = cluster.account_id
-    region = cluster.region
-
-    if not account:
+    if not info.account_id:
         logger.debug("No account_id, skipping ECR rewrite for %s", image)
         return image
 
-    return f"{account}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
+    return f"{info.account_id}.dkr.ecr.{region}.amazonaws.com/docker-hub/{stripped}"
 
 
 # -- Image resolution (three tiers) --------------------------------------------
@@ -129,21 +150,27 @@ def _ecr_image_uri(image: str, cluster: ClusterConfig, logger: logging.Logger) -
 async def resolve_image(
     environment_dir: Path,
     task_env_config: EnvironmentConfig,
-    cluster: ClusterConfig,
+    region: str,
+    role_arn: str | None,
+    info: ClusterInfo,
     logger: logging.Logger,
 ) -> tuple[str, list[str]]:
 
-    image_uri, setup_cmds = await _resolve_image_uri(environment_dir, task_env_config, cluster, logger)
+    image_uri, setup_cmds = await _resolve_image_uri(
+        environment_dir, task_env_config, region, role_arn, info, logger,
+    )
 
-    if cluster.dockerhub_cache_enabled:
-        image_uri = _ecr_image_uri(image_uri, cluster, logger)
+    if info.dockerhub_cache_enabled:
+        image_uri = _ecr_image_uri(image_uri, region, info, logger)
     return image_uri, setup_cmds
 
 
 async def _resolve_image_uri(
     environment_dir: Path,
     task_env_config: EnvironmentConfig,
-    cluster: ClusterConfig,
+    region: str,
+    role_arn: str | None,
+    info: ClusterInfo,
     logger: logging.Logger,
 ) -> tuple[str, list[str]]:
     # Tier 1: explicit image
@@ -165,7 +192,7 @@ async def _resolve_image_uri(
 
     # Tier 3: real build
     logger.info("[image] tier 3 (build): falling back to docker build")
-    return await _build_image_via_docker(environment_dir, cluster, logger), []
+    return await _build_image_via_docker(environment_dir, region, role_arn, info, logger), []
 
 
 def _parse_simple_dockerfile(environment_dir: Path) -> tuple[str, list[str]] | None:
@@ -234,7 +261,9 @@ def _dockerfile_logical_lines(environment_dir: Path) -> list[str]:
 
 async def _build_image_via_docker(
     environment_dir: Path,
-    cluster: ClusterConfig,
+    region: str,
+    role_arn: str | None,
+    info: ClusterInfo,
     logger: logging.Logger,
 ) -> str:
     """Build the environment Dockerfile locally and push it to ECR.
@@ -245,9 +274,7 @@ async def _build_image_via_docker(
     """
     dockerfile = environment_dir / "Dockerfile"
     tag = hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:16]
-    account = cluster.account_id
-    region = cluster.region
-    ecr_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{_ECR_REPO}:{tag}"
+    ecr_uri = f"{info.account_id}.dkr.ecr.{region}.amazonaws.com/{_ECR_REPO}:{tag}"
 
     # Per-tag lock to avoid duplicate builds when many trials share a Dockerfile
     if tag not in _build_locks:
@@ -256,18 +283,18 @@ async def _build_image_via_docker(
     async with _build_locks[tag]:
         # Cache check stays outside the semaphore — gating it would serialize
         # every cache hit, which is the common path at scale.
-        if await asyncio.to_thread(_ecr_image_exists, tag, cluster):
+        if await asyncio.to_thread(_ecr_image_exists, tag, region, role_arn):
             logger.debug("Using cached build %s", ecr_uri)
             return ecr_uri
 
         async with _get_ecr_semaphore():
             logger.info("Building and pushing image %s", ecr_uri)
-            await asyncio.to_thread(_docker_build_and_push, ecr_uri, environment_dir, cluster)
+            await asyncio.to_thread(_docker_build_and_push, ecr_uri, environment_dir, region, role_arn)
             return ecr_uri
 
 
-def _ecr_image_exists(tag: str, cluster: ClusterConfig) -> bool:
-    ecr = _get_ecr_client(cluster)
+def _ecr_image_exists(tag: str, region: str, role_arn: str | None) -> bool:
+    ecr = _get_ecr_client(region, role_arn)
     try:
         ecr.describe_images(repositoryName=_ECR_REPO, imageIds=[{"imageTag": tag}])
         return True
@@ -275,9 +302,8 @@ def _ecr_image_exists(tag: str, cluster: ClusterConfig) -> bool:
         return False
 
 
-def _docker_build_and_push(ecr_uri: str, environment_dir: Path, cluster: ClusterConfig) -> None:
-    session = cluster.create_boto3_session()
-    ecr = session.client("ecr", region_name=cluster.region)
+def _docker_build_and_push(ecr_uri: str, environment_dir: Path, region: str, role_arn: str | None) -> None:
+    ecr = _boto3_session(region, role_arn).client("ecr", region_name=region)
 
     # Ensure repo exists with 90-day lifecycle policy
     try:

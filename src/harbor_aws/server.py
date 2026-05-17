@@ -21,7 +21,7 @@ from kubernetes import config as k8s_config
 
 from harbor_aws.core import pods
 from harbor_aws.core.pods import RUNNER_CONFIGMAP
-from harbor_aws.core.watcher import PodWatcher
+from harbor_aws.core.pods_status_watcher import PodStatusWatcher
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +60,19 @@ class ControlServer:
         self.tls_cert_file = os.environ["HARBOR_TLS_CERT_FILE"]
         self.tls_key_file = os.environ["HARBOR_TLS_KEY_FILE"]
         self.namespace = os.environ["HARBOR_NAMESPACE"]
+        self.info = {
+            "namespace": self.namespace,
+            "account_id": os.environ["HARBOR_ACCOUNT_ID"],
+            "k8s_service_account": os.environ["HARBOR_K8S_SERVICE_ACCOUNT"],
+            "dockerhub_cache_enabled": os.environ["HARBOR_DOCKERHUB_CACHE_ENABLED"] == "true",
+        }
         self.trials: dict[str, _TrialConn] = {}
         self.trials_lock = asyncio.Lock()
 
         k8s_config.load_incluster_config()
         self.k8s_api = k8s_client.CoreV1Api()
         self.pod_create_semaphore = asyncio.Semaphore(POD_CREATE_SEMAPHORE_SIZE)
-        self.pod_watcher: PodWatcher | None = None
+        self.pod_status_watcher: PodStatusWatcher | None = None
 
         try:
             self.k8s_api.read_namespaced_config_map(name=RUNNER_CONFIGMAP, namespace=self.namespace)
@@ -79,7 +85,7 @@ class ControlServer:
             raise
 
     async def start(self) -> None:
-        self.pod_watcher = await PodWatcher.create(self.namespace)
+        self.pod_status_watcher = await PodStatusWatcher.create(self.namespace)
         app = web.Application(client_max_size=MAX_PAYLOAD_BYTES)
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_post("/register", self._handle_register)
@@ -89,6 +95,7 @@ class ControlServer:
         app.router.add_post("/delete-pod", self._handle_delete_pod)
         app.router.add_post("/wait-pod-running", self._handle_wait_pod_running)
         app.router.add_get("/list-pods", self._handle_list_pods)
+        app.router.add_get("/info", self._handle_info)
         self.api_runner = web.AppRunner(app, access_log=None)
         await self.api_runner.setup()
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -238,6 +245,11 @@ class ControlServer:
 
     async def _handle_healthz(self, _request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "trials": len(self.trials)})
+
+    async def _handle_info(self, request: web.Request) -> web.Response:
+        if not self._check_admin(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(self.info)
 
     async def _handle_register(self, request: web.Request) -> web.Response:
         """Pre-register a trial and wait for the runner to dial in."""
@@ -440,7 +452,7 @@ class ControlServer:
         if not pod_name:
             return web.json_response({"error": "missing pod_name"}, status=400)
         try:
-            await self.pod_watcher.wait_pod_running(pod_name, timeout=WAIT_POD_RUNNING_TIMEOUT_SEC)
+            await self.pod_status_watcher.wait_pod_running(pod_name, timeout=WAIT_POD_RUNNING_TIMEOUT_SEC)
         except TimeoutError:
             return web.json_response(
                 {"error": f"pod {pod_name} did not become Running in "

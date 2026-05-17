@@ -1,204 +1,23 @@
-"""AWS config, Kubernetes client, and CloudFormation stack loader."""
+"""Process-wide types for the orchestrator."""
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import os
-import subprocess
-import threading
 from dataclasses import dataclass
-
-import boto3
-from kubernetes import client
-from kubernetes import config as k8s_config
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
-
-logger = logging.getLogger(__name__)
-
-NLB_SERVICE = "harbor-control-nlb"
-API_PORT = 8443
 
 
 @dataclass(frozen=True)
-class ClusterConfig:
-    """Process-wide cluster configuration loaded from a CloudFormation stack.
+class ClusterInfo:
+    """Operational metadata fetched from the control pod's ``/info`` endpoint."""
 
-    All fields are shared across every trial in the process. Construct via
-    ``load_config_from_stack()``; do not instantiate directly.
-    """
-
-    # AWS credentials
-    region: str = "us-east-1"
-    role_arn: str | None = None  # Set for cross-account; None for same account
-
-    # EKS
-    eks_cluster_name: str = "harbor-aws"
-    namespace: str = "harbor"
-    k8s_service_account: str | None = None
-
-    # AWS account (needed for ECR pull-through cache URI)
-    account_id: str | None = None
-
-    # Stack-based configuration
-    stack_name: str | None = None
-
-    # Pinned TLS cert for the control pod's HTTPS API (self-signed, from stack output).
-    nlb_cert_pem: str = ""
-
-    # Bearer token for the control pod's HTTPS API (from stack output).
-    bearer_token: str = ""
-
-    # Whether the ECR pull-through cache for Docker Hub was wired up at deploy.
-    # When true, the image resolver rewrites Docker Hub URIs to use the cache.
-    dockerhub_cache_enabled: bool = False
-
-    def validate(self) -> None:
-        """Validate that required fields are set."""
-        if not self.eks_cluster_name:
-            raise ValueError(
-                "Missing required cluster config field: eks_cluster_name. "
-                "Use stack_name to read from CloudFormation outputs."
-            )
-
-    def create_boto3_session(self) -> boto3.Session:
-        """Create a boto3 session, assuming role_arn if provided (cross-account)"""
-        if not self.role_arn:
-            return boto3.Session(region_name=self.region)
-
-        sts = boto3.client("sts", region_name=self.region)
-        
-        try:
-            caller_arn = sts.get_caller_identity()["Arn"]
-            target_account = self.role_arn.split(":")[4]
-            target_role_name = self.role_arn.rsplit("/", 1)[-1]
-            if (f"::{target_account}:" in caller_arn
-                    and f":assumed-role/{target_role_name}/" in caller_arn):
-                logger.debug("Already in target role %s, skipping AssumeRole", self.role_arn)
-                return boto3.Session(region_name=self.region)
-        except Exception:
-            logger.debug("Caller identity check failed; proceeding with AssumeRole", exc_info=True)
-
-        creds = sts.assume_role(RoleArn=self.role_arn, RoleSessionName="harbor-aws")["Credentials"]
-        return boto3.Session(
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-            region_name=self.region,
-        )
-
-    def _cli_env(self) -> dict[str, str] | None:
-        """Environment variables for running AWS CLI with cross-account credentials."""
-        if not self.role_arn:
-            return None
-        session = self.create_boto3_session()
-        creds = session.get_credentials().get_frozen_credentials()
-        env = {**os.environ, "AWS_ACCESS_KEY_ID": creds.access_key,
-               "AWS_SECRET_ACCESS_KEY": creds.secret_key}
-        if creds.token:
-            env["AWS_SESSION_TOKEN"] = creds.token
-        return env
+    namespace: str
+    account_id: str
+    k8s_service_account: str
+    dockerhub_cache_enabled: bool
 
 
 @dataclass(frozen=True)
 class TrialOptions:
     """Per-trial overrides set by the adapter caller (kwargs to ``AWSEnvironment``)."""
 
-    # Maximum pod lifetime in seconds (default: 4 hours)
     pod_timeout_sec: int = 14400
-
-    # If True, attach the cluster's pod service account so the pod can call Bedrock.
     use_bedrock: bool = False
-
-
-_kubeconfig_setup_lock = threading.Lock()
-_kubeconfig_setup_done = False
-
-
-def create_k8s_client(config: ClusterConfig) -> client.CoreV1Api:
-    global _kubeconfig_setup_done
-
-    with _kubeconfig_setup_lock:
-        if not _kubeconfig_setup_done:
-            cmd = ["aws", "eks", "update-kubeconfig",
-                   "--name", config.eks_cluster_name, "--region", config.region]
-            if config.role_arn:
-                cmd += ["--role-arn", config.role_arn]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, env=config._cli_env())
-            k8s_config.load_kube_config()
-            _kubeconfig_setup_done = True
-
-    return client.CoreV1Api(api_client=client.ApiClient())
-
-
-async def load_config_from_stack(
-    stack_name: str,
-    region: str = "us-east-1",
-    role_arn: str | None = None,
-) -> ClusterConfig:
-    """Load ClusterConfig from CloudFormation stack outputs."""
-
-    tmp = ClusterConfig(region=region, role_arn=role_arn)
-
-    def _read_outputs() -> tuple[dict[str, str], str]:
-        session = tmp.create_boto3_session()
-        cfn = session.client("cloudformation")
-        response = cfn.describe_stacks(StackName=stack_name)
-
-        stacks = response.get("Stacks", [])
-        if not stacks:
-            raise RuntimeError(
-                f"Stack '{stack_name}' not found. "
-                f"Deploy with: python -m harbor_aws deploy --stack-name {stack_name} --region {region}"
-            )
-
-        stack = stacks[0]
-        if stack["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"):
-            raise RuntimeError(f"Stack '{stack_name}' is in status {stack['StackStatus']}")
-
-        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
-        account_id = session.client("sts").get_caller_identity()["Account"]
-        return outputs, account_id
-
-    outputs, account_id = await asyncio.to_thread(_read_outputs)
-    logger.debug("Loaded %d outputs from stack '%s'", len(outputs), stack_name)
-
-    config = ClusterConfig(
-        region=region,
-        role_arn=role_arn,
-        stack_name=stack_name,
-        eks_cluster_name=_required(outputs, "EksClusterName", stack_name),
-        namespace=_required(outputs, "Namespace", stack_name),
-        k8s_service_account=outputs.get("PodServiceAccount"),  # optional — only used when bedrock=True
-        account_id=account_id,
-        nlb_cert_pem=_required(outputs, "HarborNlbCert", stack_name),
-        bearer_token=_required(outputs, "HarborAdminToken", stack_name),
-        dockerhub_cache_enabled=_required(outputs, "DockerHubCacheEnabled", stack_name) == "true",
-    )
-
-    config.validate()
-    return config
-
-
-@retry(stop=stop_after_attempt(10), wait=wait_exponential_jitter(initial=2, max=10, jitter=2), reraise=True)
-def discover_nlb_url(api: client.CoreV1Api, namespace: str) -> str:
-    """Read the NLB hostname from the harbor-control-nlb Service status."""
-    svc = api.read_namespaced_service(name=NLB_SERVICE, namespace=namespace)
-    lb_status = getattr(svc.status, "load_balancer", None) if svc.status else None
-    ingress = getattr(lb_status, "ingress", None) if lb_status else None
-    if not ingress or not ingress[0].hostname:
-        raise RuntimeError(
-            f"Service '{NLB_SERVICE}' in namespace '{namespace}' has no LB hostname yet "
-            f"(AWS Load Balancer Controller may still be provisioning)."
-        )
-    return f"https://{ingress[0].hostname}:{API_PORT}"
-
-
-def _required(outputs: dict[str, str], key: str, stack_name: str) -> str:
-    """Read a CloudFormation output that must exist on a healthy deploy."""
-    if key not in outputs:
-        raise RuntimeError(
-            f"Stack '{stack_name}' is missing required output '{key}'. "
-            f"Redeploy with the current harbor-aws CDK: harbor-aws deploy --stack-name {stack_name}"
-        )
-    return outputs[key]
